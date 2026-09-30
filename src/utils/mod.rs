@@ -14,6 +14,7 @@ pub mod rate_limit;
 pub mod scan_id;
 pub mod shimmer;
 pub mod term;
+pub(crate) mod xml;
 
 /// Largest permit count `tokio::sync::Semaphore::new` accepts; it asserts
 /// above this. Taken from tokio's own public constant rather than hand-copying
@@ -48,8 +49,8 @@ pub(crate) use scan_id::{make_scan_id, make_unique_scan_id, short_scan_id};
 pub(crate) use http::{
     apply_header_overrides, build_body_request_base, build_preflight_request, build_request,
     build_request_with_cookie, compose_cookie_header_excluding, content_type_is_never_markup,
-    content_type_primary, is_htmlish_content_type, is_javascript_content_type,
-    is_xss_scannable_content_type, send_with_retry,
+    content_type_primary, is_htmlish_content_type, is_javascript_content_type, is_xml_content_type,
+    is_xss_scannable_content_type, response_has_markup_document, send_with_retry,
 };
 
 // Re-export remote payload/wordlist getters at `crate::utils::*`
@@ -106,6 +107,13 @@ fn target_identity_key_owned(url: &str) -> String {
     }
 }
 
+/// Drop a leading `http://` / `https://`, leaving anything else untouched.
+fn strip_url_scheme(url: &str) -> &str {
+    url.strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+        .unwrap_or(url)
+}
+
 /// Decide whether a finding URL was produced by scanning a given target URL.
 ///
 /// Used both by `collapse_redundant_reflected` (dedup) and the
@@ -127,6 +135,22 @@ fn target_identity_key_owned(url: &str) -> String {
 /// `/api/v1/bar`) will both match a single finding. This mirrors the
 /// pre-existing prefix-match behavior; single-target scans are unaffected.
 pub(crate) fn finding_belongs_to_target(target_url: &str, finding_url: &str) -> bool {
+    // Compare without the scheme. A scan is allowed to follow exactly one
+    // scheme change — the same-host `http` -> `https` form-action upgrade that
+    // `utils::http::same_origin_or_tls_upgrade` permits — and the finding is
+    // then recorded at the upgraded action URL. Attribution has to follow that
+    // hop too: comparing with the scheme attached, an `http://host/page` target
+    // whose form posts to `https://host/login` matches none of the three
+    // strategies below, so it counts zero findings and is summarised as `clean`
+    // while the same run lists the XSS in `results`.
+    //
+    // The cost is that a scan listing both `http://host/x` and `https://host/x`
+    // as separate targets attributes one finding to both, which is the same
+    // over-attribution the trade-off note above already accepts — and the
+    // failure it replaces (a target reporting `clean` while it produced
+    // findings) is the far worse of the two.
+    let target_url = strip_url_scheme(target_url);
+    let finding_url = strip_url_scheme(finding_url);
     if target_url == finding_url {
         return true;
     }

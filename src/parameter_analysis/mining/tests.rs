@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr};
 use tokio::time::{Duration, sleep};
 
+mod bucket_attribution;
 mod collapse_recall;
 mod request_efficiency;
 
@@ -120,6 +121,24 @@ fn test_detect_injection_context_script_backtick_wins_over_earlier_quote() {
     let ctx = detect_injection_context(&body);
     assert_eq!(
         ctx,
+        InjectionContext::Javascript(Some(DelimiterType::Backtick))
+    );
+}
+
+/// A quote inside a template literal is template text: the enclosing
+/// delimiter is the backtick, so `${…}` is the breakout that gets sent. The
+/// closest-quote guess picked SingleQuote and the finding stayed R.
+#[test]
+fn test_detect_injection_context_quote_inside_template_literal() {
+    let marker = crate::scanning::markers::open_marker();
+    let handler = format!("<button onclick=\"foo(`a '{}' b`)\">x</button>", marker);
+    assert_eq!(
+        detect_injection_context(&handler),
+        InjectionContext::Javascript(Some(DelimiterType::Backtick))
+    );
+    let script = format!("<script>var s = `a \"{}\" b`;</script>", marker);
+    assert_eq!(
+        detect_injection_context(&script),
         InjectionContext::Javascript(Some(DelimiterType::Backtick))
     );
 }
@@ -891,6 +910,49 @@ async fn test_probe_dictionary_params_discovers_with_custom_wordlist() {
 }
 
 #[tokio::test]
+async fn custom_wordlist_strips_a_leading_utf8_bom() {
+    async fn reflect_secret(Query(params): Query<HashMap<String, String>>) -> Html<String> {
+        Html(format!(
+            "<html><body>{}</body></html>",
+            params.get("secret").map(String::as_str).unwrap_or("")
+        ))
+    }
+
+    let app = Router::new().route("/r", get(reflect_secret));
+    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("bind test listener");
+    let addr = listener.local_addr().expect("local addr");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    sleep(Duration::from_millis(20)).await;
+    let target = parse_target(&format!("http://{addr}/r")).expect("target parses");
+    let wordlist = TempWordlist::new("bom-wordlist", "\u{feff}secret\n");
+    let mut args = default_scan_args();
+    args.mining_dict_word = Some(wordlist.as_str());
+
+    let reflection_params = Arc::new(Mutex::new(Vec::<Param>::new()));
+    probe_dictionary_params(
+        &target,
+        &args,
+        reflection_params.clone(),
+        Arc::new(tokio::sync::Semaphore::new(1)),
+        None,
+    )
+    .await;
+
+    let params = reflection_params.lock().await;
+    assert!(
+        params
+            .iter()
+            .any(|param| param.name == "secret" && param.location == Location::Query),
+        "a BOM-prefixed custom wordlist must still probe its first name, got {:?}",
+        params.iter().map(|param| &param.name).collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test]
 async fn test_probe_dictionary_params_sentinel_pre_probe_collapses() {
     let addr = start_reflect_all_server().await;
     let target =
@@ -972,6 +1034,130 @@ async fn test_probe_body_params_discovers_reflected_form_field() {
         "expected a body param discovered, got {:?}",
         params.iter().map(|p| &p.name).collect::<Vec<_>>()
     );
+}
+
+async fn reflect_last_form_q(body: axum::body::Bytes) -> Html<String> {
+    let pairs: Vec<(String, String)> = form_urlencoded::parse(&body)
+        .map(|(name, value)| (name.into_owned(), value.into_owned()))
+        .collect();
+    let last = pairs
+        .iter()
+        .filter(|(name, _)| name == "q")
+        .map(|(_, value)| value.as_str())
+        .next_back()
+        .unwrap_or("");
+    Html(format!("<html><body>{last}</body></html>"))
+}
+
+#[tokio::test]
+async fn body_discovery_payload_reaches_last_duplicate_form_value() {
+    // Discovery substitutes every duplicate form key. The actual scan sender
+    // must do the same for applications that read the last occurrence.
+    let app = Router::new().route("/b", axum::routing::post(reflect_last_form_q));
+    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("bind test listener");
+    let addr = listener.local_addr().expect("local addr");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    sleep(Duration::from_millis(20)).await;
+
+    let mut target = parse_target(&format!("http://{addr}/b")).expect("target parses");
+    target.data = Some("q=first&q=last".to_string());
+    let mut args = default_scan_args();
+    args.data = target.data.clone();
+
+    let client = target.build_client_or_default();
+    let control = client
+        .post(target.url.clone())
+        .header("Content-Type", "application/x-www-form-urlencoded")
+        .body("q=first&q=control")
+        .send()
+        .await
+        .expect("control request should reach the test server");
+    assert_eq!(
+        control.text().await.expect("read control response"),
+        "<html><body>control</body></html>"
+    );
+
+    let reflection_params = Arc::new(Mutex::new(Vec::<Param>::new()));
+    probe_body_params(
+        &target,
+        &args,
+        reflection_params.clone(),
+        Arc::new(tokio::sync::Semaphore::new(1)),
+        None,
+    )
+    .await;
+    let param = reflection_params
+        .lock()
+        .await
+        .iter()
+        .find(|param| param.name == "q" && param.location == Location::Body)
+        .expect("body discovery should find q using its all-duplicate probe")
+        .clone();
+
+    let target = Arc::new(target);
+    let client = target.build_client_or_default();
+    let response =
+        crate::scanning::url_inject::build_inject_request(&client, &target, &param, "PAY")
+            .send()
+            .await
+            .expect("scan injection request should reach the mock server");
+    let reflected = response.text().await.expect("read response");
+    assert_eq!(
+        reflected, "<html><body>PAY</body></html>",
+        "the last-value body parameter must receive the scan payload"
+    );
+}
+
+#[tokio::test]
+async fn imported_raw_http_and_har_bodies_are_mined_without_cli_data() {
+    // Request imports store their captured body on Target, not ScanArgs.data.
+    // The analysis stage must pass that body into the body miners or both
+    // import paths silently scan a POST without ever testing its fields.
+    let addr = start_body_reflect_server().await;
+    let url = format!("http://{}:{}/b", addr.ip(), addr.port());
+    let raw = format!(
+        "POST {url} HTTP/1.1\r\nHost: {}:{}\r\nContent-Type: application/x-www-form-urlencoded\r\n\r\nuser=alice&token=t",
+        addr.ip(),
+        addr.port()
+    );
+    let raw_target =
+        crate::target_parser::parse_raw_http_request(&raw).expect("raw request parses");
+
+    let har = format!(
+        r#"{{"log":{{"entries":[{{"request":{{"method":"POST","url":"{url}","headers":[{{"name":"Content-Type","value":"application/x-www-form-urlencoded"}}],"postData":{{"mimeType":"application/x-www-form-urlencoded","text":"user=alice&token=t"}}}}}}]}}}}"#
+    );
+    let har_target = crate::target_parser::parse_har(&har)
+        .expect("HAR parses")
+        .into_iter()
+        .next()
+        .expect("HAR has one request");
+
+    for mut target in [raw_target, har_target] {
+        let mut args = default_scan_args();
+        args.skip_discovery = true;
+        args.skip_mining = true;
+        assert!(args.data.is_none(), "test must not pass a CLI body");
+
+        crate::parameter_analysis::analyze_parameters(&mut target, &args, None).await;
+
+        assert!(
+            target
+                .reflection_params
+                .iter()
+                .any(|param| param.location == Location::Body && param.name == "user"),
+            "imported {} body field was never tested: {:?}",
+            target.method,
+            target
+                .reflection_params
+                .iter()
+                .map(|param| (&param.name, &param.location))
+                .collect::<Vec<_>>()
+        );
+    }
 }
 
 async fn reflect_json_handler(body: axum::body::Bytes) -> Html<String> {
@@ -1154,6 +1340,44 @@ async fn start_raw_body_reflect_server() -> SocketAddr {
     addr
 }
 
+async fn record_multipart_timing(
+    axum::extract::State(timestamps): axum::extract::State<Arc<Mutex<Vec<tokio::time::Instant>>>>,
+    request: axum::http::Request<axum::body::Body>,
+) -> Html<String> {
+    let (parts, body) = request.into_parts();
+    if parts
+        .headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.starts_with("multipart/form-data"))
+    {
+        timestamps.lock().await.push(tokio::time::Instant::now());
+    }
+    let body = axum::body::to_bytes(body, usize::MAX)
+        .await
+        .unwrap_or_default();
+    Html(format!(
+        "<html><body>{}</body></html>",
+        String::from_utf8_lossy(&body)
+    ))
+}
+
+async fn start_multipart_timing_server() -> (SocketAddr, Arc<Mutex<Vec<tokio::time::Instant>>>) {
+    let timestamps = Arc::new(Mutex::new(Vec::new()));
+    let app = Router::new()
+        .route("/r", axum::routing::any(record_multipart_timing))
+        .with_state(timestamps.clone());
+    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("bind listener");
+    let addr = listener.local_addr().expect("listener addr");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    sleep(Duration::from_millis(20)).await;
+    (addr, timestamps)
+}
+
 #[tokio::test]
 async fn test_probe_multipart_params_seeds_explicit_field() {
     // `-p file:multipart` is a known multipart sink. Before, MultipartBody
@@ -1181,6 +1405,47 @@ async fn test_probe_multipart_params_seeds_explicit_field() {
             .iter()
             .map(|p| (&p.name, &p.location))
             .collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test]
+async fn test_probe_multipart_params_honors_delay_between_probes() {
+    // `--delay` paces body/JSON/XML probes, but multipart mining used to send
+    // its serialized probes back-to-back. The request counter is process
+    // global, so share the same lock as run_scan tests while exercising it.
+    let _serial = crate::REQUEST_COUNTER_TEST_LOCK.lock().await;
+    let (addr, timestamps) = start_multipart_timing_server().await;
+    let mut target =
+        parse_target(&format!("http://{}:{}/r", addr.ip(), addr.port())).expect("parse target");
+    target.method = "POST".to_string();
+    target.delay = 250;
+    let mut args = default_scan_args();
+    args.method = "POST".to_string();
+    args.data = Some("first=one&second=two".to_string());
+    args.param = vec![
+        "first:multipart".to_string(),
+        "second:multipart".to_string(),
+    ];
+
+    probe_multipart_params(
+        &target,
+        &args,
+        Arc::new(Mutex::new(Vec::<Param>::new())),
+        Arc::new(tokio::sync::Semaphore::new(1)),
+        None,
+    )
+    .await;
+
+    let timestamps = timestamps.lock().await;
+    assert_eq!(
+        timestamps.len(),
+        2,
+        "both multipart probes should reach the server"
+    );
+    let interval = timestamps[1].duration_since(timestamps[0]);
+    assert!(
+        interval >= Duration::from_millis(200),
+        "multipart probes arrived {interval:?} apart despite --delay 250"
     );
 }
 
@@ -1266,7 +1531,7 @@ fn test_has_knockout_html_clause_boundary_cases() {
 /// A page with exactly 15 distinct field names that echoes *every* query
 /// parameter. 15 is deliberate: the sentinel pre-probe only runs above
 /// `SENTINEL_PROBE_COUNT * 5`, so this shape slips past it and forces the
-/// adaptive EWMA collapse instead — the branch that was never exercised.
+/// post-bucket adaptive EWMA collapse instead.
 async fn reflect_everything_handler(Query(params): Query<HashMap<String, String>>) -> Html<String> {
     let echoed: String = params.values().cloned().collect::<Vec<_>>().join(" ");
     let mut form = String::from("<form>");
@@ -1714,5 +1979,17 @@ async fn probe_xml_body_params_fires_on_xml_prolog_without_content_type() {
             .await
             .iter()
             .any(|p| p.name == "msg" && p.location == Location::XmlBody)
+    );
+}
+
+/// The script body starts after the open tag's real `>`, not one inside a
+/// quoted attribute value — otherwise the prefix begins with `b">` and the
+/// computed closer is wrong.
+#[test]
+fn test_detect_js_breakout_with_marker_skips_quoted_gt_in_open_tag() {
+    let body = "<script data-x=\"a>b\">h([\"4815162342\"]);</script>";
+    assert_eq!(
+        detect_js_breakout_with_marker(body, "4815162342").as_deref(),
+        Some("\"])")
     );
 }

@@ -98,10 +98,6 @@ fn test_content_type_primary_invalid_inputs() {
 fn test_is_htmlish_content_type_allow_list() {
     assert!(is_htmlish_content_type("text/html"));
     assert!(is_htmlish_content_type("application/xhtml+xml"));
-    assert!(is_htmlish_content_type("application/xml; charset=utf-8"));
-    assert!(is_htmlish_content_type("text/xml"));
-    assert!(is_htmlish_content_type("application/rss+xml"));
-    assert!(is_htmlish_content_type("application/atom+xml"));
 }
 
 #[test]
@@ -109,7 +105,164 @@ fn test_is_htmlish_content_type_deny_list() {
     assert!(!is_htmlish_content_type("application/json"));
     assert!(!is_htmlish_content_type("text/plain"));
     assert!(!is_htmlish_content_type("image/svg+xml"));
+    assert!(!is_htmlish_content_type("application/xml; charset=utf-8"));
+    assert!(!is_htmlish_content_type("text/xml"));
+    assert!(!is_htmlish_content_type("application/rss+xml"));
+    assert!(!is_htmlish_content_type("application/atom+xml"));
     assert!(!is_htmlish_content_type("invalid"));
+}
+
+#[test]
+fn response_has_markup_document_follows_browser_parser_type() {
+    let html = "<!doctype html><html><body><script>alert(1)</script></body></html>";
+    let xhtml = "<html xmlns=\"http://www.w3.org/1999/xhtml\"><body><script>alert(1)</script></body></html>";
+    let svg = "<svg xmlns=\"http://www.w3.org/2000/svg\"><script>alert(1)</script></svg>";
+
+    assert!(response_has_markup_document(
+        "text/html; charset=utf-8",
+        html
+    ));
+    assert!(response_has_markup_document(
+        "application/xhtml+xml; charset=utf-8",
+        xhtml
+    ));
+    assert!(response_has_markup_document(
+        "image/svg+xml; charset=utf-8",
+        svg
+    ));
+
+    for content_type in [
+        "application/json",
+        "application/javascript",
+        "text/plain",
+        "text/plain; charset=utf-8",
+        "text/plain; charset=windows-1252",
+        "text/csv",
+        "image/png",
+    ] {
+        assert!(
+            !response_has_markup_document(content_type, html),
+            "{content_type} must not be parsed as an HTML document"
+        );
+    }
+}
+
+#[test]
+fn response_has_markup_document_sniffs_only_unknown_types_and_valid_xml_documents() {
+    let html = "  \n<!DOCTYPE html><html><script>alert(1)</script></html>";
+    let json = r#"{"q":"<script>alert(1)</script>"}"#;
+    let bare_svg = "<svg xmlns=\"http://www.w3.org/2000/svg\"><script>alert(1)</script></svg>";
+    let valid_xhtml = "<html xmlns=\"http://www.w3.org/1999/xhtml\"><body /></html>";
+    let valid_svg = "<svg xmlns=\"http://www.w3.org/2000/svg\"><script /></svg>";
+
+    assert!(response_has_markup_document("", html));
+    assert!(response_has_markup_document("not a mime type", html));
+    for unknown_type in ["unknown/unknown", "application/unknown", "*/*"] {
+        assert!(response_has_markup_document(unknown_type, html));
+    }
+    assert!(!response_has_markup_document("", json));
+    assert!(!response_has_markup_document("", bare_svg));
+    assert!(!response_has_markup_document(
+        "",
+        "<script\t>alert(1)</script>"
+    ));
+    assert!(!response_has_markup_document(
+        "",
+        "<script\n>alert(1)</script>"
+    ));
+    assert!(!response_has_markup_document(
+        "application/xhtml+xml",
+        "<html><body><script>alert(1)</script></body></html>"
+    ));
+    assert!(!response_has_markup_document(
+        "application/xhtml+xml",
+        "<html xmlns=\"http://www.w3.org/1999/xhtml\"><body><script>alert(1)</body></html>"
+    ));
+    assert!(response_has_markup_document(
+        "application/xhtml+xml",
+        valid_xhtml
+    ));
+    assert!(response_has_markup_document("image/svg+xml", valid_svg));
+    let namespaced_xhtml =
+        "<doc xmlns:h=\"http://www.w3.org/1999/xhtml\"><h:script>alert(1)</h:script></doc>";
+    let namespaced_svg = "<doc xmlns:s=\"http://www.w3.org/2000/svg\"><s:svg><s:script>alert(1)</s:script></s:svg></doc>";
+    for xml_type in [
+        "application/xml",
+        "text/xml; charset=utf-8",
+        "application/atom+xml",
+    ] {
+        assert!(response_has_markup_document(xml_type, namespaced_xhtml));
+        assert!(response_has_markup_document(xml_type, namespaced_svg));
+        assert!(!response_has_markup_document(
+            xml_type,
+            "<doc><script>alert(1)</script></doc>"
+        ));
+    }
+    assert!(!response_has_markup_document(
+        "image/svg+xml",
+        "<svg xmlns=\"http://www.w3.org/2000/svg\"><script>alert(1)</svg>"
+    ));
+}
+
+#[test]
+fn xml_doctypes_and_recovery_documents_keep_browser_active_markup() {
+    let xhtml_doctype = concat!(
+        "<!DOCTYPE html PUBLIC \"-//W3C//DTD XHTML 1.0 Strict//EN\" ",
+        "\"http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd\">",
+        "<html xmlns=\"http://www.w3.org/1999/xhtml\"><body>&nbsp;</body></html>"
+    );
+    let svg_doctype = concat!(
+        "<!DOCTYPE svg PUBLIC \"-//W3C//DTD SVG 1.1//EN\" ",
+        "\"http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd\">",
+        "<svg xmlns=\"http://www.w3.org/2000/svg\"><script>alert(1)</script></svg>"
+    );
+    let malformed_xhtml = concat!(
+        "<html xmlns=\"http://www.w3.org/1999/xhtml\"><body>",
+        "<script>alert(1)</script><broken></body></html>"
+    );
+
+    assert!(response_has_markup_document(
+        "application/xhtml+xml",
+        xhtml_doctype
+    ));
+    assert!(response_has_markup_document("image/svg+xml", svg_doctype));
+    assert!(response_has_markup_document(
+        "application/xhtml+xml",
+        malformed_xhtml
+    ));
+}
+
+#[test]
+fn xml_response_types_at_ten_thousand_depth_use_bounded_recovery() {
+    let deep = "<n>".repeat(10_000);
+    let close = "</n>".repeat(10_000);
+    let fixtures = [
+        (
+            "application/xml",
+            format!(
+                "<root><script xmlns=\"http://www.w3.org/1999/xhtml\">alert(1)</script>{deep}{close}</root>"
+            ),
+        ),
+        (
+            "application/xhtml+xml",
+            format!(
+                "<html xmlns=\"http://www.w3.org/1999/xhtml\"><body><script>alert(1)</script>{deep}{close}</body></html>"
+            ),
+        ),
+        (
+            "image/svg+xml",
+            format!(
+                "<svg xmlns=\"http://www.w3.org/2000/svg\"><script>alert(1)</script>{deep}{close}</svg>"
+            ),
+        ),
+    ];
+
+    for (content_type, body) in fixtures {
+        assert!(
+            response_has_markup_document(content_type, &body),
+            "{content_type} should use its active markup prefix after depth overflow"
+        );
+    }
 }
 
 #[test]
@@ -134,6 +287,8 @@ fn test_is_xss_scannable_content_type_allow_list() {
     assert!(is_xss_scannable_content_type("text/html"));
     assert!(is_xss_scannable_content_type("application/json"));
     assert!(is_xss_scannable_content_type("application/javascript"));
+    assert!(is_xss_scannable_content_type("application/xml"));
+    assert!(is_xss_scannable_content_type("application/atom+xml"));
     assert!(is_xss_scannable_content_type(
         "text/javascript; charset=utf-8"
     ));
@@ -173,6 +328,8 @@ fn test_content_type_is_inert_data_keeps_executable_and_sniffable() {
     assert!(!content_type_is_inert_data("text/html"));
     assert!(!content_type_is_inert_data("application/xhtml+xml"));
     assert!(!content_type_is_inert_data("image/svg+xml"));
+    assert!(!content_type_is_inert_data("application/xml"));
+    assert!(!content_type_is_inert_data("application/atom+xml"));
     assert!(!content_type_is_inert_data("application/javascript"));
     assert!(!content_type_is_inert_data(
         "text/javascript; charset=utf-8"
@@ -599,13 +756,14 @@ fn test_a_typeless_response_is_still_treated_as_live() {
 
 #[test]
 fn test_content_type_is_never_markup_keeps_live_types_live() {
-    // A genuinely executable or renderable type must stay scannable. JSONP is
-    // the one that would hurt — `application/javascript` executes via
-    // `<script src>` regardless of any response header.
+    // A type whose body may contain active markup must reach the body-aware
+    // gate. XML is conditional on namespace and well-formedness.
     for ct in [
         "text/html",
         "application/xhtml+xml",
         "image/svg+xml",
+        "application/xml",
+        "application/atom+xml",
         "application/javascript",
         "text/javascript",
     ] {
@@ -934,5 +1092,138 @@ fn an_unparsable_override_still_surfaces_as_a_builder_error() {
     assert!(
         built.is_err(),
         "an invalid header name must not be swallowed"
+    );
+}
+
+#[test]
+fn is_same_origin_compares_scheme_host_and_port() {
+    let u = |s: &str| url::Url::parse(s).unwrap();
+    assert!(is_same_origin(
+        &u("https://example.com/a"),
+        &u("https://example.com/b?x=1")
+    ));
+    // Implicit and explicit default ports are the same origin.
+    assert!(is_same_origin(
+        &u("https://example.com/a"),
+        &u("https://example.com:443/b")
+    ));
+    for (a, b) in [
+        ("https://example.com/a", "https://evil.example/b"),
+        ("https://example.com/a", "http://example.com/b"),
+        ("https://example.com/a", "https://example.com:8443/b"),
+        // Same scheme, different port: a different service on the same host.
+        ("http://example.com:8765/a", "http://example.com:9988/b"),
+    ] {
+        assert!(!is_same_origin(&u(a), &u(b)), "{a} vs {b}");
+    }
+}
+
+#[test]
+fn same_origin_or_tls_upgrade_allows_only_the_default_port_http_to_https_hop() {
+    let u = |s: &str| url::Url::parse(s).unwrap();
+
+    // Everything same-origin still passes...
+    assert!(same_origin_or_tls_upgrade(
+        &u("https://example.com/page"),
+        &u("https://example.com/login")
+    ));
+    // ...plus the "page over HTTP, form posts over TLS" shape this exists for.
+    assert!(same_origin_or_tls_upgrade(
+        &u("http://example.com/page"),
+        &u("https://example.com/login")
+    ));
+    assert!(same_origin_or_tls_upgrade(
+        &u("http://example.com:80/page"),
+        &u("https://example.com:443/login")
+    ));
+
+    for (page, dest, why) in [
+        (
+            "https://example.com/page",
+            "http://example.com/login",
+            "a TLS downgrade would walk credentials onto plaintext",
+        ),
+        (
+            "http://example.com/page",
+            "https://evil.example/login",
+            "a different host is foreign however the scheme changes",
+        ),
+        (
+            "http://example.com:8080/page",
+            "https://example.com/login",
+            "the carve-out is only for the default port pair",
+        ),
+        (
+            "http://example.com/page",
+            "https://example.com:8443/login",
+            "likewise on the destination side",
+        ),
+        (
+            "http://example.com:8765/page",
+            "http://example.com:9988/login",
+            "a same-scheme port hop is a different service, carve-out or not",
+        ),
+        (
+            "http://example.com/page",
+            "https://example.com.evil/login",
+            "a suffix-extended host is a different host",
+        ),
+        (
+            "http://example.com/page",
+            "https://evil.example\\@example.com/login",
+            "an authority-confusing spelling resolves to the host before the backslash",
+        ),
+    ] {
+        assert!(
+            !same_origin_or_tls_upgrade(&u(page), &u(dest)),
+            "{page} -> {dest} must be refused: {why}"
+        );
+    }
+}
+
+/// The gate both form-parsing paths now share. Covers what neither
+/// `check_form_discovery` nor `xss_blind::blind_scan_forms_with` can assert
+/// end to end without standing up a TLS listener.
+#[test]
+fn resolve_probeable_form_action_gates_the_destination() {
+    let page = url::Url::parse("http://example.com/page").unwrap();
+    let probe = |action: &str| {
+        crate::utils::http::resolve_probeable_form_action(&page, action).map(|u| u.to_string())
+    };
+
+    // Empty and "#" actions submit back to the page itself.
+    assert_eq!(probe(""), Some("http://example.com/page".to_string()));
+    assert_eq!(probe("#"), Some("http://example.com/page".to_string()));
+    // Relative and absolute same-origin actions resolve normally.
+    assert_eq!(
+        probe("/login"),
+        Some("http://example.com/login".to_string())
+    );
+    assert_eq!(
+        probe("http://example.com/login"),
+        Some("http://example.com/login".to_string())
+    );
+    // The upgrade this carve-out exists for.
+    assert_eq!(
+        probe("https://example.com/login"),
+        Some("https://example.com/login".to_string())
+    );
+
+    for action in [
+        "https://attacker.example/collect",
+        "http://example.com:8443/collect",
+        // Authority terminated by a backslash: resolves to `attacker.example`,
+        // which a textual check against the page URL would miss.
+        "https://attacker.example\\@example.com/collect",
+        "//attacker.example/collect",
+    ] {
+        assert_eq!(probe(action), None, "action {action} must be skipped");
+    }
+
+    // A TLS page must not be talked back down to plaintext.
+    let tls_page = url::Url::parse("https://example.com/page").unwrap();
+    assert_eq!(
+        crate::utils::http::resolve_probeable_form_action(&tls_page, "http://example.com/login"),
+        None
     );
 }

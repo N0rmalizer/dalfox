@@ -445,6 +445,96 @@ fn test_get_dom_payloads_javascript_context_returns_breakout_payloads() {
 }
 
 #[test]
+fn test_get_dom_payloads_javascript_context_carries_string_breakouts() {
+    use crate::parameter_analysis::DelimiterType;
+    let args = default_scan_args();
+    for (delim, wants) in [
+        (
+            DelimiterType::SingleQuote,
+            &[
+                "'-alert(1)-'",
+                "'+alert(1)+'",
+                "'*alert(1)*'",
+                "');alert(1)//",
+                "':alert(1),'",
+            ][..],
+        ),
+        (
+            DelimiterType::DoubleQuote,
+            &[
+                "\"-alert(1)-\"",
+                "\"+alert(1)+\"",
+                "\"*alert(1)*\"",
+                "\");alert(1)//",
+                "\":alert(1),\"",
+            ][..],
+        ),
+        (DelimiterType::Backtick, &["${alert(1)}"][..]),
+    ] {
+        let param = Param {
+            injection_context: Some(InjectionContext::Javascript(Some(delim))),
+            ..Param::new("q".to_string(), "seed".to_string(), Location::Query)
+        };
+        let payloads = get_dom_payloads(&param, &args).expect("dom payload generation");
+        for want in wants {
+            assert!(
+                payloads.iter().any(|p| p == want),
+                "JS context must carry the `{want}` string breakout"
+            );
+        }
+        // The expression breakouts come before the `</script>` tag breakouts,
+        // and the whole catalog stays far below the per-param safety cap.
+        let first_tag = payloads.iter().position(|p| p.contains("</script>"));
+        let last_expr = payloads.iter().rposition(|p| wants.contains(&p.as_str()));
+        assert!(last_expr < first_tag, "expression breakouts must lead");
+        assert!(payloads.len() < crate::cmd::scan::DEFAULT_PAYLOAD_SAFETY_CAP / 2);
+    }
+}
+
+#[test]
+fn test_get_dom_payloads_javascript_string_breakouts_are_raw_and_bounded_ahead_of_tags() {
+    use crate::parameter_analysis::DelimiterType;
+    let args = default_scan_args();
+    let expression = get_js_expression_breakout_payloads(Some(&DelimiterType::DoubleQuote));
+    let dom = |escaped: Option<Vec<char>>| {
+        let param = Param {
+            injection_context: Some(InjectionContext::Javascript(Some(
+                DelimiterType::DoubleQuote,
+            ))),
+            escaped_specials: escaped,
+            ..Param::new("q".to_string(), "seed".to_string(), Location::Query)
+        };
+        get_dom_payloads(&param, &args).expect("dom payload generation")
+    };
+
+    // Raw only: each string breakout is sent once, never through the encoders.
+    let payloads = dom(None);
+    for e in &expression {
+        assert_eq!(payloads.iter().filter(|p| *p == e).count(), 1, "`{e}`");
+    }
+    let tags =
+        crate::encoding::apply_encoders_to_payloads(&get_js_breakout_payloads(), &args.encoders);
+    assert_eq!(
+        payloads.len(),
+        get_jsonp_callback_payloads().len() + expression.len() + tags.len(),
+        "only the tag breakouts go through the encoders"
+    );
+
+    // A `</script>`-exploitable string must reach the tag breakouts after at
+    // most one form per joiner (the JSONP verifiers lead the whole list).
+    let jsonp = get_jsonp_callback_payloads().len();
+    let first_tag = payloads
+        .iter()
+        .position(|p| p.contains("</script>"))
+        .expect("tag breakouts present");
+    assert!(first_tag <= jsonp + 5, "tag breakouts start at {first_tag}");
+
+    // A JS-escaped delimiter quote defeats every raw-quote breakout.
+    let payloads = dom(Some(vec!['"']));
+    assert!(payloads[jsonp].contains("</script>"));
+}
+
+#[test]
 fn test_get_dom_payloads_html_context_includes_encoded_variants() {
     let param = Param {
         injection_context: Some(InjectionContext::Html(None)),
@@ -459,10 +549,45 @@ fn test_get_dom_payloads_html_context_includes_encoded_variants() {
 }
 
 #[test]
-fn test_get_dom_payloads_unknown_context_falls_back_even_with_only_custom() {
-    let param = Param::new("q".to_string(), "seed".to_string(), Location::Query);
+fn test_get_dom_payloads_only_custom_honors_known_contexts() {
+    use crate::parameter_analysis::InjectionContext;
+
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system time")
+        .as_nanos();
+    let path = std::env::temp_dir().join(format!(
+        "dalfox-only-custom-{}-{unique}.txt",
+        std::process::id()
+    ));
+    std::fs::write(&path, "<custom-only-payload>\n").expect("write custom payload fixture");
+
     let mut args = default_scan_args();
     args.only_custom_payload = true;
+    args.custom_payload = Some(path.to_string_lossy().into_owned());
+    args.encoders = vec!["none".to_string()];
+
+    for context in [
+        InjectionContext::Html(None),
+        InjectionContext::Attribute(None),
+        InjectionContext::Javascript(None),
+    ] {
+        let param = Param {
+            injection_context: Some(context),
+            ..Param::new("q".to_string(), "seed".to_string(), Location::Query)
+        };
+        let payloads = get_dom_payloads(&param, &args).expect("DOM payload generation");
+        assert_eq!(payloads, vec!["<custom-only-payload>".to_string()]);
+    }
+
+    std::fs::remove_file(path).expect("remove custom payload fixture");
+}
+
+#[test]
+fn test_get_dom_payloads_unknown_context_falls_back_without_custom_restriction() {
+    let param = Param::new("q".to_string(), "seed".to_string(), Location::Query);
+    let mut args = default_scan_args();
+    args.only_custom_payload = false;
     args.custom_payload = None;
     args.encoders = vec!["none".to_string()];
 
@@ -1327,6 +1452,123 @@ async fn test_run_scanning_realworld_level1_shape_promotes_to_verified() {
         "V finding must carry a DomEvidenceKind label from classify_dom_evidence; got {:?}",
         labels
     );
+}
+
+/// A reflection inside a server `on*` handler's single-quoted JS argument.
+/// `/inert` JS-escapes then HTML-escapes the input, so nothing can close the
+/// string: no payload may verify (the inline-handler check used to accept a
+/// `</script><svg onload=alert(1)>` payload sitting inside the string).
+/// `/vuln` only HTML-escapes; the browser decodes `&#x27;` at attribute-parse
+/// time (xss-game L4), so a string breakout must verify — which needs the JS
+/// DOM catalog to carry `'-alert(1)-'`-style payloads, not only `</script>`
+/// tag breakouts that are inert in a handler.
+#[tokio::test]
+async fn test_run_scanning_inline_handler_string_reflection_verifies_only_real_breakout() {
+    use axum::{Router, extract::Query, response::Html, routing::get};
+    use std::collections::HashMap;
+    use std::net::{Ipv4Addr, SocketAddr};
+    use tokio::time::{Duration, sleep};
+
+    fn html_escape(s: &str) -> String {
+        s.replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+            .replace('"', "&quot;")
+            .replace('\'', "&#x27;")
+    }
+    async fn inert(Query(p): Query<HashMap<String, String>>) -> Html<String> {
+        let q = p.get("q").cloned().unwrap_or_default();
+        let js = q.replace('\\', "\\\\").replace('\'', "\\'");
+        Html(format!(
+            "<img src=x onload=\"startTimer('{}')\">",
+            html_escape(&js)
+        ))
+    }
+    async fn vuln(Query(p): Query<HashMap<String, String>>) -> Html<String> {
+        let q = p.get("q").cloned().unwrap_or_default();
+        Html(format!(
+            "<img src=x onload=\"startTimer('{}')\">",
+            html_escape(&q)
+        ))
+    }
+
+    // Vulnerable twins behind a filter that strips `-` (only the `+`/`*`/closer
+    // joiners survive), one with the reflection in an object-key position.
+    async fn nodash(Query(p): Query<HashMap<String, String>>) -> Html<String> {
+        let q = p.get("q").cloned().unwrap_or_default().replace('-', "");
+        Html(format!(
+            "<img src=x onload=\"startTimer('{}')\">",
+            html_escape(&q)
+        ))
+    }
+    async fn objkey(Query(p): Query<HashMap<String, String>>) -> Html<String> {
+        let q = p.get("q").cloned().unwrap_or_default().replace('-', "");
+        Html(format!(
+            "<button onclick=\"go({{'{}':1}})\">x</button>",
+            html_escape(&q)
+        ))
+    }
+
+    let app = Router::new()
+        .route("/inert", get(inert))
+        .route("/vuln", get(vuln))
+        .route("/nodash", get(nodash))
+        .route("/objkey", get(objkey));
+    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("bind test listener");
+    let addr: SocketAddr = listener.local_addr().expect("local addr");
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("serve test app");
+    });
+    sleep(Duration::from_millis(20)).await;
+
+    for (path, expect_verified) in [
+        ("inert", false),
+        ("vuln", true),
+        ("nodash", true),
+        ("objkey", true),
+    ] {
+        let mut target = parse_target(&format!("http://{addr}/{path}?q=a")).expect("parse_target");
+        target.reflection_params.push(Param {
+            injection_context: Some(InjectionContext::Javascript(Some(
+                crate::parameter_analysis::DelimiterType::SingleQuote,
+            ))),
+            // What discovery records for both routes: the HTML-escaped
+            // characters come back encoded, so the reflection phase's adaptive
+            // payloads drop every quote-bearing breakout and only the DOM phase
+            // can verify.
+            invalid_specials: Some(vec!['\'', '"', '<', '>', '&']),
+            valid_specials: Some(vec!['(', ')', '-', '+', ';', '/', '=', '`']),
+            ..Param::new("q".to_string(), "a".to_string(), Location::Query)
+        });
+        let results = Arc::new(Mutex::new(Vec::new()));
+        run_scanning(
+            &target,
+            Arc::new(integration_scan_args(false)),
+            ScanRunHandles::new(results.clone(), Arc::new(AtomicUsize::new(0))),
+        )
+        .await;
+        let guard = results.lock().await;
+        let verified: Vec<_> = guard
+            .iter()
+            .filter(|r| matches!(r.result_type, FindingType::Verified))
+            .map(|r| r.payload.clone())
+            .collect();
+        if expect_verified {
+            assert!(
+                verified
+                    .iter()
+                    .any(|p| p.starts_with('\'') && !p.contains("</script>")),
+                "/{path}: a string breakout must verify; got {verified:?}"
+            );
+        } else {
+            assert!(
+                verified.is_empty(),
+                "/{path}: inert reflection verified: {verified:?}"
+            );
+        }
+    }
 }
 
 /// Issue #1156 — a self-/canonical-link-style echo that reflects every payload
@@ -2398,6 +2640,94 @@ fn build_request_text_body_renders_pre_encoded_value() {
 }
 
 #[test]
+fn build_request_text_query_renders_the_as_sent_url() {
+    // The request POC must show the URL `build_url_inject_request` sends: the
+    // pre-encoded value (base64("PAY") == "UEFZ"), not the raw payload the
+    // server would never decode back into the sink.
+    let mut param = req_param("q", "seed", Location::Query);
+    param.pre_encoding = Some("base64".to_string());
+    let target = target_for("https://example.com/s?q=seed&x=1");
+    let req = super::build_request_text(&target, &param, "PAY");
+    assert!(req.starts_with("GET /s?q=UEFZ&x=1 "), "req:\n{req}");
+
+    // A nested-field param (`qs.move_url`, base64-of-JSON inside `qs`) is sent
+    // under its wire name with the whole pipeline applied, not as a new
+    // `qs.move_url=<raw>` pair.
+    let pipeline = crate::encoding::pipeline::EncodingPipeline::new(vec![
+        crate::encoding::pipeline::EncodingStep::JsonField {
+            pointer: "/u".to_string(),
+            template: serde_json::json!({"u": "x"}),
+        },
+        crate::encoding::pipeline::EncodingStep::Base64,
+    ]);
+    let nested = Param {
+        wire_name: Some("qs".to_string()),
+        pre_encoding_pipeline: Some(pipeline.clone()),
+        ..req_param("qs.u", "x", Location::Query)
+    };
+    let target = target_for("https://example.com/s?qs=eyJ1IjoieCJ9");
+    let req = super::build_request_text(&target, &nested, "PAY");
+    let sent = crate::scanning::url_inject::build_injected_url(
+        &target.url,
+        &nested,
+        &pipeline.apply("PAY").unwrap(),
+    );
+    let sent = url::Url::parse(&sent).unwrap();
+    assert!(
+        req.starts_with(&format!("GET /s?{} ", sent.query().unwrap())),
+        "req:\n{req}"
+    );
+    assert!(!req.contains("qs.u="), "display name leaked, req:\n{req}");
+}
+
+#[test]
+fn build_request_text_path_renders_pre_encoded_value() {
+    // `2url` pre-encoding: the segment carries exactly two encoding layers
+    // (one from the pre-encoding, one from the segment's `%` escape), matching
+    // what the path detection probe measured.
+    let mut param = req_param("path_segment_1", "b", Location::Path);
+    param.pre_encoding = Some("2url".to_string());
+    let target = target_for("https://example.com/a/b/c");
+    let req = super::build_request_text(&target, &param, "<x>");
+    let sent = crate::scanning::url_inject::build_injected_url(
+        &target.url,
+        &param,
+        &crate::encoding::pre_encoding::apply_param_encoding("<x>", &param),
+    );
+    let sent = url::Url::parse(&sent).unwrap();
+    assert!(
+        req.starts_with(&format!("GET {} ", sent.path())),
+        "req:\n{req}"
+    );
+    assert!(req.contains("/a/%253Cx%253E/c "), "req:\n{req}");
+}
+
+#[test]
+fn build_request_text_header_and_cookie_render_pre_encoded_value() {
+    // A header / cookie param behind a size-limited WAF window is sent with
+    // the `wafpad` prefix; without it the pasted request is the one the WAF
+    // blocked.
+    let pad = crate::encoding::pre_encoding::waf_window_pad();
+    let mut header = req_param("X-Q", "", Location::Header);
+    header.pre_encoding = Some("wafpad".to_string());
+    let target = target_for("https://example.com/");
+    let req = super::build_request_text(&target, &header, "<x>");
+    assert!(req.contains(&format!("\r\nX-Q: {pad}<x>")), "req:\n{req}");
+
+    let mut cookie = req_param("sid", "abc", Location::Header);
+    cookie.pre_encoding = Some("wafpad".to_string());
+    let target = Target {
+        cookies: vec![("sid".to_string(), "abc".to_string())],
+        ..target_for("https://example.com/")
+    };
+    let req = super::build_request_text(&target, &cookie, "<x>");
+    assert!(
+        req.contains(&format!("\r\nCookie: sid={pad}<x>")),
+        "req:\n{req}"
+    );
+}
+
+#[test]
 fn build_request_text_multipart_renders_pre_encoded_value() {
     // Same contract for a multipart field: the boundary-framed part carries the
     // pre-encoded value, mirroring `build_multipart_request`.
@@ -2572,6 +2902,50 @@ fn generate_param_jobs_total_tasks_matches_payload_counts() {
 }
 
 #[test]
+fn xml_namespace_payloads_are_scoped_small_and_keep_verifiers_ahead_of_caps() {
+    let mut param = req_param("q", "seed", Location::Query);
+    param.injection_context = Some(InjectionContext::Html(None));
+    param.xml_namespace_candidate = Some("image/svg+xml; charset=utf-8".to_string());
+    param.valid_specials = Some(vec!['<', '>', '"', '\'']);
+    let target = target_with_params(vec![param]);
+    let mut args = integration_scan_args(true);
+    args.max_payloads_per_param = 1;
+    let shared = vec!["<shared-csp-payload>".to_string()];
+    let (jobs, _) = super::generate_param_jobs(&target, &args, None, &shared);
+    let (_, reflection, dom) = &jobs[0];
+    let marker = crate::scanning::markers::class_marker();
+
+    assert_eq!(reflection.len(), 1);
+    assert!(
+        reflection[0].starts_with("<svg xmlns=\"http://www.w3.org/2000/svg\""),
+        "image/svg+xml should try the SVG namespace verifier before the cap"
+    );
+    assert!(reflection[0].contains(&format!("class=\"{marker}\"")));
+    assert!(reflection[0].contains("onload=\"alert(1)\""));
+    assert!(
+        dom.is_empty(),
+        "the reflection response verifies XML payloads directly"
+    );
+    assert!(
+        !reflection
+            .iter()
+            .chain(dom)
+            .any(|payload| payload == "<shared-csp-payload>"),
+        "inert XML candidates should not regain the full shared catalog"
+    );
+
+    let mut html_param = req_param("q", "seed", Location::Query);
+    html_param.injection_context = Some(InjectionContext::Html(None));
+    let html_target = target_with_params(vec![html_param]);
+    let (html_jobs, _) = super::generate_param_jobs(&html_target, &args, None, &[]);
+    assert_ne!(
+        html_jobs[0].1,
+        crate::scanning::payload_families::get_xml_namespace_payloads("image/svg+xml"),
+        "XML namespace payloads must not replace or bloat the normal HTML family"
+    );
+}
+
+#[test]
 fn generate_param_jobs_respects_max_payloads_per_param() {
     let target = target_with_params(vec![req_param("a", "1", Location::Query)]);
     let mut args = integration_scan_args(true);
@@ -2600,6 +2974,41 @@ fn generate_param_jobs_appends_shared_payloads() {
         dom.iter().any(|p| p == "<shared-marker>"),
         "dom missing shared"
     );
+}
+
+#[test]
+fn generate_param_jobs_only_custom_excludes_generated_and_shared_payloads() {
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system time")
+        .as_nanos();
+    let path = std::env::temp_dir().join(format!(
+        "dalfox-only-custom-jobs-{}-{unique}.txt",
+        std::process::id()
+    ));
+    let custom = "<custom-only-payload>";
+    std::fs::write(&path, format!("{custom}\n")).expect("write custom payload fixture");
+
+    let mut param = req_param("a", "1", Location::Query);
+    param.injection_context = Some(InjectionContext::Html(None));
+    // Active probing records a profile even when no special characters were
+    // blocked. Job assembly must not turn that metadata into built-in payloads
+    // when the caller explicitly selected custom-only testing.
+    param.invalid_specials = Some(vec![]);
+    param.valid_specials = Some(vec!['<', '>', '"']);
+    let target = target_with_params(vec![param]);
+    let mut args = integration_scan_args(true);
+    args.only_custom_payload = true;
+    args.custom_payload = Some(path.to_string_lossy().into_owned());
+    args.encoders = vec!["none".to_string()];
+
+    let shared = vec!["<shared-builtin-payload>".to_string()];
+    let (jobs, _) = super::generate_param_jobs(&target, &args, None, &shared);
+    std::fs::remove_file(path).expect("remove custom payload fixture");
+
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(jobs[0].1, vec![custom.to_string()]);
+    assert_eq!(jobs[0].2, vec![custom.to_string()]);
 }
 
 #[test]
@@ -2776,6 +3185,22 @@ fn test_extract_meta_csp_prefers_enforcing_over_report_only() {
     assert!(content.contains("require-trusted-types-for"));
 }
 
+/// Every enforcing meta policy applies, so all of them are returned as one
+/// policy list, not just the first.
+#[test]
+fn test_extract_meta_csp_returns_every_enforcing_policy() {
+    let html = r#"<html><head>
+        <meta http-equiv="Content-Security-Policy" content="object-src 'none'">
+        <meta http-equiv="Content-Security-Policy" content="require-trusted-types-for 'script'">
+    </head><body></body></html>"#;
+    let (name, content) = extract_meta_csp(html).expect("a meta CSP is present");
+    assert_eq!(name, "Content-Security-Policy");
+    assert_eq!(
+        content,
+        "object-src 'none', require-trusted-types-for 'script'"
+    );
+}
+
 /// With only a report-only meta present, it is still returned (nothing else to
 /// fall back to).
 #[test]
@@ -2888,6 +3313,175 @@ async fn test_run_scanning_hpp_phase_reports_duplicated_param_bypass() {
         1,
         "run_hpp_phase must report at most one finding per param"
     );
+}
+
+/// A query param discovered in a `<form action=…>` lives at the action URL. The
+/// reflection and DOM phases inject there (`effective_query_base`); the HPP
+/// phase polluted `target.url` — the page hosting the form — instead, so the
+/// duplicated parameter never reached the sink and the bypass went unreported.
+#[tokio::test]
+async fn test_run_scanning_hpp_phase_targets_the_form_action_url() {
+    use axum::{Router, extract::RawQuery, response::Html, routing::get};
+    use std::net::{Ipv4Addr, SocketAddr};
+    use tokio::time::{Duration, sleep};
+
+    // Sanitizes the first `q`, renders the last one raw.
+    async fn sink(RawQuery(raw): RawQuery) -> Html<String> {
+        let raw = raw.unwrap_or_default();
+        let values: Vec<String> = raw
+            .split('&')
+            .filter_map(|pair| pair.strip_prefix("q="))
+            .map(|v| urlencoding::decode(v).unwrap_or_default().into_owned())
+            .collect();
+        match values.as_slice() {
+            [] => Html("<div>no q</div>".to_string()),
+            [first, ..] if first.contains('<') || first.contains('>') => {
+                Html("<div>blocked</div>".to_string())
+            }
+            [.., last] => Html(format!("<div>{last}</div>")),
+        }
+    }
+
+    let app = Router::new()
+        .route(
+            "/page",
+            get(|| async { Html(r#"<form action="/sink" method="get"><input name="q"></form>"#) }),
+        )
+        .route("/sink", get(sink));
+    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("bind test listener");
+    let addr: SocketAddr = listener.local_addr().expect("local addr");
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("serve test app");
+    });
+    sleep(Duration::from_millis(20)).await;
+
+    let mut target = parse_target(&format!("http://{addr}/page")).expect("parse_target");
+    target.reflection_params.push(Param {
+        injection_context: Some(InjectionContext::Html(None)),
+        form_action_url: Some(format!("http://{addr}/sink")),
+        form_origin_url: Some(format!("http://{addr}/page")),
+        ..Param::new("q".to_string(), "safe".to_string(), Location::Query)
+    });
+
+    let mut args = integration_scan_args(false);
+    args.hpp = true;
+    let results = Arc::new(Mutex::new(Vec::new()));
+    run_scanning(
+        &target,
+        Arc::new(args),
+        ScanRunHandles::new(results.clone(), Arc::new(AtomicUsize::new(0))),
+    )
+    .await;
+
+    let guard = results.lock().await;
+    let hpp: Vec<_> = guard
+        .iter()
+        .filter(|r| r.inject_type == "inHTML-HPP")
+        .collect();
+    assert_eq!(
+        hpp.len(),
+        1,
+        "the HPP bypass at the form action must be reported; got: {:?}",
+        guard
+            .iter()
+            .map(|r| (&r.result_type, r.inject_type.as_str(), r.data.as_str()))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        hpp[0].data.starts_with(&format!("http://{addr}/sink?")),
+        "the reported (and PoC) URL must be the form action, got: {}",
+        hpp[0].data
+    );
+}
+
+/// A pre-encoded param (base64 here) is sent encoded by every phase except, it
+/// used to be, HPP: the duplicated value went out raw, the server base64-decoded
+/// it to garbage, and the bypass was never seen. The reported URL must carry the
+/// encoded value too, or the PoC reproduces nothing.
+#[tokio::test]
+async fn test_run_scanning_hpp_phase_applies_param_pre_encoding() {
+    use axum::{Router, extract::RawQuery, response::Html, routing::get};
+    use base64::Engine as _;
+    use std::net::{Ipv4Addr, SocketAddr};
+    use tokio::time::{Duration, sleep};
+
+    // Base64-decodes every `q`; escapes the first, renders the last raw.
+    async fn sink(RawQuery(raw): RawQuery) -> Html<String> {
+        let raw = raw.unwrap_or_default();
+        let values: Vec<String> = raw
+            .split('&')
+            .filter_map(|pair| pair.strip_prefix("q="))
+            .map(|v| {
+                let v = urlencoding::decode(v).unwrap_or_default().into_owned();
+                base64::engine::general_purpose::STANDARD
+                    .decode(v)
+                    .ok()
+                    .and_then(|b| String::from_utf8(b).ok())
+                    .unwrap_or_default()
+            })
+            .collect();
+        match values.as_slice() {
+            [first, .., last] => Html(format!(
+                "<div>{}</div><div>{last}</div>",
+                first.replace('<', "&lt;")
+            )),
+            [only] => Html(format!("<div>{}</div>", only.replace('<', "&lt;"))),
+            [] => Html("<div>no q</div>".to_string()),
+        }
+    }
+
+    let app = Router::new().route("/", get(sink));
+    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("bind test listener");
+    let addr: SocketAddr = listener.local_addr().expect("local addr");
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("serve test app");
+    });
+    sleep(Duration::from_millis(20)).await;
+
+    let mut target = parse_target(&format!("http://{addr}/?q=c2FmZQ==")).expect("parse_target");
+    let mut param = Param {
+        injection_context: Some(InjectionContext::Html(None)),
+        ..Param::new("q".to_string(), "c2FmZQ==".to_string(), Location::Query)
+    };
+    param.pre_encoding = Some("base64".to_string());
+    target.reflection_params.push(param);
+
+    let mut args = integration_scan_args(false);
+    args.hpp = true;
+    let results = Arc::new(Mutex::new(Vec::new()));
+    run_scanning(
+        &target,
+        Arc::new(args),
+        ScanRunHandles::new(results.clone(), Arc::new(AtomicUsize::new(0))),
+    )
+    .await;
+
+    let guard = results.lock().await;
+    let hpp: Vec<_> = guard
+        .iter()
+        .filter(|r| r.inject_type == "inHTML-HPP")
+        .collect();
+    assert_eq!(
+        hpp.len(),
+        1,
+        "the HPP bypass on a base64 param must be reported; got: {:?}",
+        guard
+            .iter()
+            .map(|r| (&r.result_type, r.inject_type.as_str(), r.data.as_str()))
+            .collect::<Vec<_>>()
+    );
+    let finding = hpp[0];
+    let encoded = base64::engine::general_purpose::STANDARD.encode(&finding.payload);
+    assert!(
+        finding.data.contains(&*urlencoding::encode(&encoded)),
+        "the reported URL must carry the base64 value that was sent, got: {}",
+        finding.data
+    );
+    assert_eq!(finding.wire_payload.as_deref(), Some(encoded.as_str()));
 }
 
 /// The HPP phase is opt-in. Without `--hpp` the same target must produce no
@@ -4067,4 +4661,582 @@ fn test_dom_phase_early_exit_redirect_streak_disabled_under_deep_scan() {
         0,
         REDIRECT_STREAK_LIMIT * 10
     ));
+}
+
+/// A path segment the app URL-decodes a second time behind a `<>` filter is
+/// classified `2url` by active probing; the scan must then reach it. The
+/// multi-URL pre-encoding used to be applied in full *and* escaped again by
+/// the path-segment encoder, so every payload arrived one layer short of
+/// decoded and the param read clean.
+#[tokio::test]
+async fn path_param_classified_2url_is_scanned_with_matching_layers() {
+    use axum::{Router, extract::Path, response::Html, routing::get};
+    use std::net::Ipv4Addr;
+    async fn double_decode(Path(seg): Path<String>) -> Html<String> {
+        let filtered: String = seg.chars().filter(|c| *c != '<' && *c != '>').collect();
+        let decoded = urlencoding::decode(&filtered)
+            .map(|c| c.into_owned())
+            .unwrap_or(filtered);
+        Html(format!("<html><body><div>{decoded}</div></body></html>"))
+    }
+    let app = Router::new().route("/a/{seg}", get(double_decode));
+    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("bind test listener");
+    let addr = listener.local_addr().expect("local addr");
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("serve test app");
+    });
+
+    let mut target = parse_target(&format!("http://{addr}/a/b")).expect("parse_target");
+    let mut param = crate::parameter_analysis::active_probe_param(
+        &target,
+        Param::new(
+            "path_segment_1".to_string(),
+            "b".to_string(),
+            Location::Path,
+        ),
+        Arc::new(tokio::sync::Semaphore::new(4)),
+    )
+    .await;
+    assert_eq!(param.pre_encoding.as_deref(), Some("2url"));
+    param.injection_context = Some(InjectionContext::Html(None));
+    target.reflection_params.push(param);
+
+    let results = Arc::new(Mutex::new(Vec::new()));
+    run_scanning(
+        &target,
+        Arc::new(integration_scan_args(false)),
+        ScanRunHandles::new(results.clone(), Arc::new(AtomicUsize::new(0))),
+    )
+    .await;
+    let guard = results.lock().await;
+    assert!(
+        guard.iter().any(|r| r.param == "path_segment_1"),
+        "a 2url path param must produce a finding; got {} results",
+        guard.len()
+    );
+}
+
+/// A CSP `<meta>` outside `<head>` is ignored by browsers, so it must not be
+/// merged into the analysed policy.
+#[test]
+fn test_extract_meta_csp_ignores_meta_outside_head() {
+    let html = r#"<html><head><title>x</title></head><body>
+        <meta http-equiv="Content-Security-Policy" content="script-src 'none'">
+    </body></html>"#;
+    assert_eq!(extract_meta_csp(html), None);
+    let html = r#"<html><head>
+        <meta http-equiv="Content-Security-Policy" content="object-src 'none'">
+    </head><body>
+        <meta http-equiv="Content-Security-Policy" content="script-src 'none'">
+    </body></html>"#;
+    assert_eq!(
+        extract_meta_csp(html).map(|(_, c)| c).as_deref(),
+        Some("object-src 'none'")
+    );
+}
+
+/// End-to-end for `--sxss` per-parameter marker attribution. Two body fields
+/// (`c`, `name`) are injected at a stored sink. Which fields the sink keeps is
+/// varied; a field is credited with a Verified finding only when the retrieval
+/// page shows an element *this field* produced. Because every field is sent the
+/// same payload catalog, a shared marker would let one field's stored element
+/// satisfy another's verification — the cross-attribution this guards against.
+#[tokio::test]
+async fn sxss_credits_only_the_fields_that_actually_store() {
+    use axum::{Router, response::Html, routing::get};
+    use std::net::{Ipv4Addr, SocketAddr};
+    use std::sync::Mutex as StdMutex;
+    use tokio::time::{Duration, sleep};
+
+    async fn run_case(store_fields: &'static [&'static str]) -> Vec<(String, String)> {
+        let store: Arc<StdMutex<Vec<String>>> = Arc::default();
+        let write = store.clone();
+        let read = store.clone();
+        let app = Router::new()
+            .route(
+                "/save",
+                axum::routing::post(move |body: String| {
+                    let store = write.clone();
+                    async move {
+                        for (k, v) in url::form_urlencoded::parse(body.as_bytes()) {
+                            if store_fields.contains(&k.as_ref()) {
+                                store.lock().unwrap().push(v.into_owned());
+                            }
+                        }
+                        Html("saved")
+                    }
+                }),
+            )
+            .route(
+                "/view",
+                get(move || {
+                    let store = read.clone();
+                    async move {
+                        Html(format!(
+                            "<html><body>{}</body></html>",
+                            store.lock().unwrap().join("<hr>")
+                        ))
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let addr: SocketAddr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        sleep(Duration::from_millis(20)).await;
+
+        let mut target = parse_target(&format!("http://{addr}/page")).unwrap();
+        target.workers = 1;
+        for name in ["c", "name"] {
+            target.reflection_params.push(Param {
+                injection_context: Some(InjectionContext::Html(None)),
+                form_action_url: Some(format!("http://{addr}/save")),
+                form_origin_url: Some(format!("http://{addr}/page")),
+                ..Param::new(name.to_string(), "x".to_string(), Location::Body)
+            });
+        }
+        let mut args = integration_scan_args(false);
+        args.sxss = true;
+        args.sxss_url = Some(format!("http://{addr}/view"));
+        args.max_payloads_per_param = 40;
+        let results = Arc::new(Mutex::new(Vec::new()));
+        run_scanning(
+            &target,
+            Arc::new(args),
+            ScanRunHandles::new(results.clone(), Arc::new(AtomicUsize::new(0))),
+        )
+        .await;
+        server.abort();
+        let out: Vec<(String, String)> = results
+            .lock()
+            .await
+            .iter()
+            .filter(|r| r.result_type == FindingType::Verified)
+            .map(|r| (r.param.clone(), r.payload.clone()))
+            .collect();
+        out
+    }
+
+    // Only `c` stores: `name` must not be credited with `c`'s stored element.
+    let only_c = run_case(&["c"]).await;
+    assert!(
+        only_c.iter().all(|(p, _)| p == "c"),
+        "a field the sink never stores must not be credited: {only_c:?}"
+    );
+    assert!(
+        only_c.iter().any(|(p, _)| p == "c"),
+        "the storing field must be verified: {only_c:?}"
+    );
+
+    // Both store: each is credited (the baseline delta sees each field's own
+    // injection raise the payload's occurrence on the retrieval page).
+    let both = run_case(&["c", "name"]).await;
+    for field in ["c", "name"] {
+        assert!(
+            both.iter().any(|(p, _)| p == field),
+            "both storing fields must be verified, missing {field}: {both:?}"
+        );
+    }
+}
+
+/// The `--sxss` credit gate fails *open* when no baseline is in scope, and the
+/// baseline is a task-local that does not cross `tokio::spawn`. Drive a real
+/// `--sxss` scan through `run_scanning` and assert every attack-payload gate
+/// call during the reflection/DOM phases saw a baseline. A future spawn inside
+/// those phases (or dropping the scope) would record fail-open hits here.
+#[tokio::test]
+async fn sxss_credit_gate_always_sees_a_baseline_during_the_phases() {
+    use crate::scanning::check_reflection::{SXSS_GATE_FAIL_OPEN, SXSS_GATE_GUARD_SENTINEL};
+    use axum::{Router, response::Html, routing::get};
+    use std::net::{Ipv4Addr, SocketAddr};
+    use std::sync::Mutex as StdMutex;
+    use tokio::time::{Duration, sleep};
+
+    let store: Arc<StdMutex<Vec<String>>> = Arc::default();
+    let write = store.clone();
+    let read = store.clone();
+    // Every page carries the sentinel so only this test's gate calls are
+    // recorded (see `record_sxss_gate_fail_open`).
+    let app = Router::new()
+        .route(
+            "/save",
+            axum::routing::post(move |body: String| {
+                let store = write.clone();
+                async move {
+                    for (k, v) in url::form_urlencoded::parse(body.as_bytes()) {
+                        if k == "c" {
+                            store.lock().unwrap().push(v.into_owned());
+                        }
+                    }
+                    Html(format!("<p>{SXSS_GATE_GUARD_SENTINEL}</p>saved"))
+                }
+            }),
+        )
+        .route(
+            "/view",
+            get(move || {
+                let store = read.clone();
+                async move {
+                    Html(format!(
+                        "<html><body><p>{SXSS_GATE_GUARD_SENTINEL}</p>{}</body></html>",
+                        store.lock().unwrap().join("<hr>")
+                    ))
+                }
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let addr: SocketAddr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    sleep(Duration::from_millis(20)).await;
+
+    let mut target = parse_target(&format!("http://{addr}/page")).unwrap();
+    target.workers = 1;
+    target.reflection_params.push(Param {
+        injection_context: Some(InjectionContext::Html(None)),
+        form_action_url: Some(format!("http://{addr}/save")),
+        form_origin_url: Some(format!("http://{addr}/page")),
+        ..Param::new("c".to_string(), "x".to_string(), Location::Body)
+    });
+    let mut args = integration_scan_args(false);
+    args.sxss = true;
+    args.sxss_url = Some(format!("http://{addr}/view"));
+    args.max_payloads_per_param = 20;
+    let results = Arc::new(Mutex::new(Vec::new()));
+    run_scanning(
+        &target,
+        Arc::new(args),
+        ScanRunHandles::new(results.clone(), Arc::new(AtomicUsize::new(0))),
+    )
+    .await;
+    server.abort();
+
+    // Control: the phases actually ran and reached the gate with a stored hit.
+    assert!(
+        results
+            .lock()
+            .await
+            .iter()
+            .any(|r| r.param == "c" && r.result_type == FindingType::Verified),
+        "control: the stored field must be verified"
+    );
+    let hits = SXSS_GATE_FAIL_OPEN.lock().unwrap().clone();
+    assert!(
+        hits.is_empty(),
+        "credit gate ran without a baseline in scope for {} attack payload(s), e.g. {:?}",
+        hits.len(),
+        hits.first()
+    );
+}
+
+/// Request-budget guard for the `--sxss` store-probe. Two form fields (`c`,
+/// `name`); only `c` stores. `name` never stores, but the storing field's
+/// stale marker on the retrieval page lets it pass the (deliberately un-gated)
+/// Stage-0 probe. Without the baseline-gated store-probe it would then run the
+/// whole payload catalog — every payload correctly refused, but each refusal
+/// paying the full sxss retrieval retry loop, which measured in the tens of
+/// thousands of requests. The store-probe must stop `name` before the catalog.
+#[tokio::test]
+async fn sxss_store_probe_bounds_a_non_storing_siblings_request_budget() {
+    use axum::{Router, response::Html, routing::get};
+    use std::net::{Ipv4Addr, SocketAddr};
+    use std::sync::Mutex as StdMutex;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtOrd};
+    use tokio::time::{Duration, sleep};
+
+    let store: Arc<StdMutex<Vec<String>>> = Arc::default();
+    // Counts POSTs that inject a payload into the *non-storing* `name` field
+    // (its value is something other than the seed). This isolates the sibling's
+    // own scan cost from the storing field's, independent of when the storing
+    // field verifies and stops. The store-probe should let `name` issue only
+    // its one marker probe; without it, `name` runs the whole payload catalog.
+    let name_injections = Arc::new(AtomicUsize::new(0));
+    let write = store.clone();
+    let read = store.clone();
+    let name_inj = name_injections.clone();
+    let app = Router::new()
+        .route(
+            "/save",
+            axum::routing::post(move |body: String| {
+                let store = write.clone();
+                let name_inj = name_inj.clone();
+                async move {
+                    // Only `c` is stored; `name` is accepted and dropped.
+                    for (k, v) in url::form_urlencoded::parse(body.as_bytes()) {
+                        if k == "name" && v != "x" {
+                            name_inj.fetch_add(1, AtOrd::Relaxed);
+                        }
+                        if k == "c" {
+                            store.lock().unwrap().push(v.into_owned());
+                        }
+                    }
+                    Html("saved")
+                }
+            }),
+        )
+        .route(
+            "/view",
+            get(move || {
+                let store = read.clone();
+                async move {
+                    Html(format!(
+                        "<html><body>{}</body></html>",
+                        store.lock().unwrap().join("<hr>")
+                    ))
+                }
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let addr: SocketAddr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    sleep(Duration::from_millis(20)).await;
+
+    let mut target = parse_target(&format!("http://{addr}/page")).unwrap();
+    target.workers = 1;
+    for name in ["c", "name"] {
+        target.reflection_params.push(Param {
+            injection_context: Some(InjectionContext::Html(None)),
+            form_action_url: Some(format!("http://{addr}/save")),
+            form_origin_url: Some(format!("http://{addr}/page")),
+            ..Param::new(name.to_string(), "x".to_string(), Location::Body)
+        });
+    }
+    let mut args = integration_scan_args(false);
+    args.sxss = true;
+    args.sxss_url = Some(format!("http://{addr}/view"));
+    // A full catalog: if `name` were to run it, the hit count would be orders
+    // of magnitude over the budget below.
+    args.max_payloads_per_param = 120;
+    args.sxss_retries = 1;
+    let results = Arc::new(Mutex::new(Vec::new()));
+    run_scanning(
+        &target,
+        Arc::new(args),
+        ScanRunHandles::new(results.clone(), Arc::new(AtomicUsize::new(0))),
+    )
+    .await;
+    server.abort();
+
+    assert!(
+        results
+            .lock()
+            .await
+            .iter()
+            .any(|r| r.param == "c" && r.result_type == FindingType::Verified),
+        "control: the storing field must still be Verified"
+    );
+    let name_posts = name_injections.load(AtOrd::Relaxed);
+    // `name` never stores, so its store-probe injection does not raise the
+    // marker count above the baseline and its catalog is skipped: only the one
+    // store-probe POST reaches the sink. Without the store-probe `name` runs the
+    // full catalog (here 120 payloads plus the DOM set) — an order of magnitude
+    // more injections.
+    assert!(
+        name_posts < 10,
+        "the non-storing sibling must be stopped by the store-probe, \
+         but it injected into `name` {name_posts} times (a catalog run is 100+)"
+    );
+}
+
+/// Regression (a): a sink that stores only short values keeps the long
+/// bracketed marker out, so the field passes Stage 0 only on the short numeric
+/// fallback marker. The store-probe must try that fallback too, or the field is
+/// wrongly judged non-storing and its catalog skipped.
+#[tokio::test]
+async fn sxss_store_probe_uses_the_numeric_marker_fallback_for_length_capped_sinks() {
+    use axum::{Router, response::Html, routing::get};
+    use std::net::{Ipv4Addr, SocketAddr};
+    use std::sync::Mutex as StdMutex;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtOrd};
+    use tokio::time::{Duration, sleep};
+
+    let store: Arc<StdMutex<Vec<String>>> = Arc::default();
+    // POSTs that inject a non-seed value into `c` — i.e. the field's catalog is
+    // running rather than being skipped after the probe.
+    let c_injections = Arc::new(AtomicUsize::new(0));
+    let write = store.clone();
+    let read = store.clone();
+    let c_inj = c_injections.clone();
+    let app = Router::new()
+        .route(
+            "/save",
+            axum::routing::post(move |body: String| {
+                let store = write.clone();
+                let c_inj = c_inj.clone();
+                async move {
+                    for (k, v) in url::form_urlencoded::parse(body.as_bytes()) {
+                        if k == "c" {
+                            if v != "x" {
+                                c_inj.fetch_add(1, AtOrd::Relaxed);
+                            }
+                            // Length-capped sink: the ~36-char bracketed marker
+                            // and the long payloads never fit; the 8-char
+                            // numeric fallback marker does.
+                            if v.len() <= 10 {
+                                store.lock().unwrap().push(v.into_owned());
+                            }
+                        }
+                    }
+                    Html("saved")
+                }
+            }),
+        )
+        .route(
+            "/view",
+            get(move || {
+                let store = read.clone();
+                async move {
+                    Html(format!(
+                        "<html><body>{}</body></html>",
+                        store.lock().unwrap().join("<hr>")
+                    ))
+                }
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let addr: SocketAddr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    sleep(Duration::from_millis(20)).await;
+
+    let mut target = parse_target(&format!("http://{addr}/page")).unwrap();
+    target.workers = 1;
+    target.reflection_params.push(Param {
+        injection_context: Some(InjectionContext::Html(None)),
+        form_action_url: Some(format!("http://{addr}/save")),
+        form_origin_url: Some(format!("http://{addr}/page")),
+        ..Param::new("c".to_string(), "x".to_string(), Location::Body)
+    });
+    let mut args = integration_scan_args(false);
+    args.sxss = true;
+    args.sxss_url = Some(format!("http://{addr}/view"));
+    args.max_payloads_per_param = 40;
+    let results = Arc::new(Mutex::new(Vec::new()));
+    run_scanning(
+        &target,
+        Arc::new(args),
+        ScanRunHandles::new(results.clone(), Arc::new(AtomicUsize::new(0))),
+    )
+    .await;
+    server.abort();
+
+    // The field stores short values, so the numeric fallback credits it and its
+    // catalog runs. Without the fallback the probe sees only the too-long
+    // bracketed marker, judges it non-storing, and skips (a handful of probe
+    // injections at most).
+    let injections = c_injections.load(AtOrd::Relaxed);
+    assert!(
+        injections > 20,
+        "the length-capped field must be scanned via the numeric-marker fallback, \
+         but only {injections} payloads reached `c` (a skipped catalog is a few)"
+    );
+}
+
+/// Regression (b): a write-behind sink (the value is stored but visible on the
+/// retrieval page only after a short delay) must still be found. The store-probe
+/// window must be wide enough to observe the delayed store, and — because the
+/// store is not synchronous — the per-payload retrieval retries must be kept so
+/// a delayed payload is not missed.
+#[tokio::test]
+async fn sxss_finds_a_write_behind_store() {
+    use axum::{Router, response::Html, routing::get};
+    use std::net::{Ipv4Addr, SocketAddr};
+    use std::sync::Mutex as StdMutex;
+    use std::time::Instant;
+    use tokio::time::{Duration, sleep};
+
+    // Each stored item becomes visible on /view only ~350 ms after it was
+    // written — a write-behind sink.
+    let store: Arc<StdMutex<Vec<(Instant, String)>>> = Arc::default();
+    let write = store.clone();
+    let read = store.clone();
+    let app = Router::new()
+        .route(
+            "/save",
+            axum::routing::post(move |body: String| {
+                let store = write.clone();
+                async move {
+                    for (k, v) in url::form_urlencoded::parse(body.as_bytes()) {
+                        if k == "c" && v != "x" {
+                            store.lock().unwrap().push((Instant::now(), v.into_owned()));
+                        }
+                    }
+                    Html("saved")
+                }
+            }),
+        )
+        .route(
+            "/view",
+            get(move || {
+                let store = read.clone();
+                async move {
+                    let now = Instant::now();
+                    let visible: String = store
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .filter(|(t, _)| now.duration_since(*t) >= Duration::from_millis(350))
+                        .map(|(_, v)| v.clone())
+                        .collect::<Vec<_>>()
+                        .join("<hr>");
+                    Html(format!("<html><body>{visible}</body></html>"))
+                }
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let addr: SocketAddr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    sleep(Duration::from_millis(20)).await;
+
+    let mut target = parse_target(&format!("http://{addr}/page")).unwrap();
+    target.workers = 1;
+    target.reflection_params.push(Param {
+        injection_context: Some(InjectionContext::Html(None)),
+        form_action_url: Some(format!("http://{addr}/save")),
+        form_origin_url: Some(format!("http://{addr}/page")),
+        ..Param::new("c".to_string(), "x".to_string(), Location::Body)
+    });
+    let mut args = integration_scan_args(false);
+    args.sxss = true;
+    args.sxss_url = Some(format!("http://{addr}/view"));
+    // Default retry ramp (backoff 500 ms) covers the 350 ms write-behind delay.
+    args.sxss_retries = 3;
+    args.max_payloads_per_param = 40;
+    let results = Arc::new(Mutex::new(Vec::new()));
+    run_scanning(
+        &target,
+        Arc::new(args),
+        ScanRunHandles::new(results.clone(), Arc::new(AtomicUsize::new(0))),
+    )
+    .await;
+    server.abort();
+
+    assert!(
+        results
+            .lock()
+            .await
+            .iter()
+            .any(|r| r.param == "c" && r.result_type == FindingType::Verified),
+        "a write-behind store must still be verified: the store-probe window must \
+         observe the delayed store and the per-payload retries must be kept"
+    );
 }

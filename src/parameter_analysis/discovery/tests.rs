@@ -4,6 +4,7 @@ use crate::target_parser::parse_target;
 use axum::Router;
 use axum::extract::Query;
 use axum::http::{HeaderMap, Uri};
+use axum::response::Html;
 use axum::routing::any;
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr};
@@ -65,6 +66,172 @@ async fn start_discovery_mock_server() -> SocketAddr {
     });
     sleep(Duration::from_millis(20)).await;
     addr
+}
+
+async fn reflect_last_query_value(uri: Uri) -> String {
+    uri.query()
+        .into_iter()
+        .flat_map(|query| url::form_urlencoded::parse(query.as_bytes()))
+        .filter(|(name, _)| name == "q")
+        .last()
+        .map(|(_, value)| value.into_owned())
+        .unwrap_or_default()
+}
+
+async fn reflect_x_dual_header(headers: HeaderMap) -> String {
+    headers
+        .get("x-dual")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("")
+        .to_string()
+}
+
+#[tokio::test]
+async fn same_named_header_and_cookie_keep_distinct_injection_locations() {
+    // Headers and cookies share Location::Header in the parameter model. If a
+    // target carries both with the same name, inferring cookie-ness from the
+    // target alone misroutes the reflected header payload into Cookie.
+    let app = Router::new().route("/", any(reflect_x_dual_header));
+    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("bind test listener");
+    let addr = listener.local_addr().expect("local addr");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    sleep(Duration::from_millis(20)).await;
+
+    let mut target = parse_target(&format!("http://{addr}/")).expect("target parses");
+    target
+        .headers
+        .push(("X-Dual".to_string(), "header-seed".to_string()));
+    target
+        .cookies
+        .push(("X-Dual".to_string(), "cookie-seed".to_string()));
+
+    let args = default_scan_args();
+    let reflection_params = Arc::new(Mutex::new(Vec::<Param>::new()));
+    let semaphore = Arc::new(Semaphore::new(2));
+    check_header_discovery(&target, &args, reflection_params.clone(), semaphore.clone()).await;
+    check_cookie_discovery(&target, &args, reflection_params.clone(), semaphore).await;
+    {
+        let mut params = reflection_params.lock().await;
+        dedupe_reflection_params(&mut params);
+    }
+
+    let param = reflection_params
+        .lock()
+        .await
+        .iter()
+        .find(|param| param.name == "X-Dual" && param.location == Location::Header)
+        .expect("header reflection should be discovered")
+        .clone();
+    let target = Arc::new(target);
+    let client = target.build_client_or_default();
+    let response =
+        crate::scanning::url_inject::build_inject_request(&client, &target, &param, "PAY")
+            .send()
+            .await
+            .expect("injection request should reach the mock server");
+    assert_eq!(
+        response.text().await.expect("read response"),
+        "PAY",
+        "the payload must be sent in the header slot that discovery found"
+    );
+}
+
+#[tokio::test]
+async fn query_discovery_reaches_last_value_duplicate_parameters() {
+    // Some servers use the last occurrence of a repeated query key. Since the
+    // scanner represents that key as one named parameter, its payload sender
+    // must mutate every occurrence or only the first receives the payload.
+    let app = Router::new().route("/", any(reflect_last_query_value));
+    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("bind test listener");
+    let addr = listener.local_addr().expect("local addr");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    sleep(Duration::from_millis(20)).await;
+
+    let target = parse_target(&format!("http://{addr}/?q=first&q=last")).unwrap();
+    let reflection_params = Arc::new(Mutex::new(Vec::<Param>::new()));
+    check_query_discovery(
+        &target,
+        reflection_params.clone(),
+        Arc::new(Semaphore::new(1)),
+    )
+    .await;
+
+    let params = reflection_params.lock().await;
+    let param = params
+        .iter()
+        .find(|param| param.name == "q" && param.location == Location::Query)
+        .expect("query discovery should find the repeated q parameter")
+        .clone();
+    drop(params);
+
+    // Exercise the same sender the reflection and verification phases use,
+    // including any pre-encoding discovery attached to the parameter. A
+    // successful discovery alone is insufficient if scan payloads still land
+    // only in the duplicate occurrence this server ignores.
+    let target = Arc::new(target);
+    let client = target.build_client_or_default();
+    let payload = crate::encoding::pre_encoding::apply_param_encoding("PAY", &param);
+    let response =
+        crate::scanning::url_inject::build_inject_request(&client, &target, &param, &payload)
+            .send()
+            .await
+            .expect("scan injection request should reach the mock server");
+    let reflected = response.text().await.expect("read mock response");
+    assert_eq!(
+        reflected, "PAY",
+        "the scanner payload must replace the value consumed by last-value servers"
+    );
+}
+
+async fn reflect_only_double_slash_path(uri: Uri) -> String {
+    if uri.path().contains("//") {
+        format!("<body>{}</body>", uri.path())
+    } else {
+        "<body>no matching route</body>".to_string()
+    }
+}
+
+#[tokio::test]
+async fn path_discovery_preserves_empty_route_segments() {
+    // Repeated slashes are empty path segments and can be part of a route.
+    // This sink responds only on paths retaining the original `//`, so a
+    // discovery request that flattens the path misses both path parameters.
+    let app = Router::new().route("/{*rest}", any(reflect_only_double_slash_path));
+    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("bind test listener");
+    let addr = listener.local_addr().expect("local addr");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    sleep(Duration::from_millis(20)).await;
+
+    let target = parse_target(&format!("http://{addr}/a//b/")).unwrap();
+    let reflection_params = Arc::new(Mutex::new(Vec::<Param>::new()));
+    check_path_discovery(
+        &target,
+        reflection_params.clone(),
+        Arc::new(Semaphore::new(1)),
+    )
+    .await;
+
+    let params = reflection_params.lock().await;
+    assert_eq!(
+        params
+            .iter()
+            .filter(|param| param.location == Location::Path)
+            .count(),
+        2,
+        "both non-empty path segments should be probed on the original route"
+    );
 }
 
 #[tokio::test]
@@ -897,4 +1064,408 @@ async fn spawned_discovery_requests_reach_the_per_job_counter() {
          {counted} counted vs {served} served means the spawned workers fell back \
          to the process-wide globals — which is also the rate-limit bypass"
     );
+}
+
+/// Serves a page holding one POST form whose `action` the test chooses, and
+/// echoes any submitted body back so a probe that lands here reflects its
+/// marker. The listener is bound before the HTML is built so an action can
+/// point at this same server's port.
+async fn start_form_page_server(make_action: impl FnOnce(SocketAddr) -> String) -> SocketAddr {
+    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("bind form page listener");
+    let addr = listener.local_addr().expect("local addr");
+    let html = format!(
+        "<html><body><form action=\"{}\" method=\"POST\">\
+         <input name=\"q\" value=\"search\">\
+         <input name=\"user\" value=\"test\">\
+         </form></body></html>",
+        make_action(addr)
+    );
+    let app = Router::new()
+        .route(
+            "/",
+            any(move || {
+                let html = html.clone();
+                async move { html }
+            }),
+        )
+        .route(
+            "/{*rest}",
+            any(|body: String| async move { format!("echo {body}") }),
+        );
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    sleep(Duration::from_millis(20)).await;
+    addr
+}
+
+/// Stands in for the attacker's collector: counts every request it receives and
+/// echoes the body, so a probe that reaches it both trips the counter and would
+/// be recorded as a discovered parameter.
+async fn start_foreign_origin_server(hits: Arc<std::sync::atomic::AtomicUsize>) -> SocketAddr {
+    let app = Router::new().route(
+        "/{*rest}",
+        any(move |body: String| {
+            let hits = hits.clone();
+            async move {
+                hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                format!("echo {body}")
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("bind foreign listener");
+    let addr = listener.local_addr().expect("local addr");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    sleep(Duration::from_millis(20)).await;
+    addr
+}
+
+async fn discover_form_params(page: SocketAddr) -> Vec<Param> {
+    let mut target = parse_target(&format!("http://{}/?q=test", page)).unwrap();
+    target.delay = 1;
+    let reflection_params = Arc::new(Mutex::new(Vec::<Param>::new()));
+    check_form_discovery(
+        &target,
+        reflection_params.clone(),
+        Arc::new(Semaphore::new(4)),
+    )
+    .await;
+    reflection_params.lock().await.clone()
+}
+
+async fn reflect_get_form_route_state(uri: Uri) -> String {
+    let pairs: Vec<(String, String)> = uri
+        .query()
+        .into_iter()
+        .flat_map(|query| url::form_urlencoded::parse(query.as_bytes()))
+        .map(|(name, value)| (name.into_owned(), value.into_owned()))
+        .collect();
+    let mode = pairs
+        .iter()
+        .find(|(name, _)| name == "mode")
+        .map(|(_, value)| value.as_str());
+    if mode == Some("search") {
+        pairs
+            .iter()
+            .filter(|(name, _)| name == "q")
+            .map(|(_, value)| value.as_str())
+            .next_back()
+            .unwrap_or("missing q")
+            .to_string()
+    } else {
+        "missing route state".to_string()
+    }
+}
+
+async fn reflect_first_q_or_form(uri: Uri) -> Html<String> {
+    let first_q = uri
+        .query()
+        .into_iter()
+        .flat_map(|query| url::form_urlencoded::parse(query.as_bytes()))
+        .find(|(name, _)| name == "q")
+        .map(|(_, value)| value.into_owned());
+    match first_q.as_deref() {
+        Some("foo") => Html(
+            "<html><body><form method=\"GET\"><input name=\"q\" value=\"seed\"></form></body></html>"
+                .to_string(),
+        ),
+        Some(value) => Html(format!("<html><body>{value}</body></html>")),
+        None => Html("<html><body>missing q</body></html>".to_string()),
+    }
+}
+
+#[tokio::test]
+async fn get_form_discovery_replaces_page_query_collision_for_first_value_server() {
+    // An action-less GET form resolves to the page URL. If its `q` control is
+    // appended to the page's `?q=foo`, a first-value server never sees the
+    // probe marker and discovery misses the field.
+    let app = Router::new().route("/", any(reflect_first_q_or_form));
+    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("bind first-value form listener");
+    let addr = listener.local_addr().expect("local addr");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    sleep(Duration::from_millis(20)).await;
+
+    let target = parse_target(&format!("http://{addr}/?q=foo")).expect("target parses");
+    let reflection_params = Arc::new(Mutex::new(Vec::<Param>::new()));
+    check_form_discovery(
+        &target,
+        reflection_params.clone(),
+        Arc::new(Semaphore::new(4)),
+    )
+    .await;
+
+    let param = reflection_params
+        .lock()
+        .await
+        .iter()
+        .find(|param| param.name == "q" && param.location == Location::Query)
+        .expect("discovery must replace the action's first q value")
+        .clone();
+    let target = Arc::new(target);
+    let client = target.build_client_or_default();
+    let response =
+        crate::scanning::url_inject::build_inject_request(&client, &target, &param, "PAY")
+            .send()
+            .await
+            .expect("scan injection request should reach the page");
+    assert_eq!(
+        response.text().await.expect("read response"),
+        "<html><body>PAY</body></html>",
+        "the scan sender and discovery probe must both replace the colliding page query"
+    );
+}
+
+#[tokio::test]
+async fn get_form_discovery_preserves_action_query_for_probe_and_injection() {
+    // Discovery and injection retain unrelated action-query state such as
+    // `mode=search`; clearing it sends the probe to a different route.
+    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("bind form listener");
+    let addr = listener.local_addr().expect("local addr");
+    let html = "<form action=\"/search?mode=search\" method=\"GET\"><input name=\"q\" value=\"seed\"></form>";
+    let app = Router::new()
+        .route("/", any(move || async move { html.to_string() }))
+        .route("/{*rest}", any(reflect_get_form_route_state));
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    sleep(Duration::from_millis(20)).await;
+
+    let target = parse_target(&format!("http://{addr}/")).expect("target parses");
+    let reflection_params = Arc::new(Mutex::new(Vec::<Param>::new()));
+    check_form_discovery(
+        &target,
+        reflection_params.clone(),
+        Arc::new(Semaphore::new(4)),
+    )
+    .await;
+
+    let param = reflection_params
+        .lock()
+        .await
+        .iter()
+        .find(|param| param.name == "q" && param.location == Location::Query)
+        .expect("GET form discovery should find q when action state is retained")
+        .clone();
+    assert!(
+        param
+            .form_action_url
+            .as_deref()
+            .is_some_and(|action| { action.contains("?mode=search") })
+    );
+
+    // Verify the ordinary payload request takes the same action URL and keeps
+    // the route-state query that made discovery possible.
+    let target = Arc::new(target);
+    let client = target.build_client_or_default();
+    let response =
+        crate::scanning::url_inject::build_inject_request(&client, &target, &param, "PAY")
+            .send()
+            .await
+            .expect("scan injection request should reach the form action");
+    assert_eq!(response.text().await.expect("read response"), "PAY");
+}
+
+#[tokio::test]
+async fn test_check_form_discovery_probes_same_origin_form_action() {
+    // Relative and absolute spellings of the target's own origin both resolve
+    // through `Url::join`, so both must survive the origin gate. This is the
+    // control for the two skip tests below: without it they would still pass
+    // if form discovery stopped working altogether.
+    for action in ["/submit", "ABSOLUTE"] {
+        let page = start_form_page_server(|addr| {
+            if action == "ABSOLUTE" {
+                format!("http://{}/submit", addr)
+            } else {
+                action.to_string()
+            }
+        })
+        .await;
+
+        let params = discover_form_params(page).await;
+        // Assert the `Location`, not just the name: this two-field form also
+        // trips the `fields.len() <= 3` JSON-body probe, which records every
+        // field as `JsonBody` on a single reflecting response. Matching on the
+        // name alone would stay green even if the per-field urlencoded POST
+        // loop — the path this control exists to cover — stopped working.
+        for field in ["q", "user"] {
+            assert!(
+                params
+                    .iter()
+                    .any(|p| p.name == field && p.location == Location::Body),
+                "same-origin form action {action} should discover `{field}` as a \
+                 urlencoded body param, got {:?}",
+                params
+                    .iter()
+                    .map(|p| (&p.name, &p.location))
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_check_form_discovery_skips_cross_origin_form_action() {
+    // A scanned page that points its form at another origin must not make
+    // dalfox send the operator's credentials there. The foreign server echoes,
+    // so a regression shows up twice: as a request count and as a discovered
+    // param carrying that host in `form_action_url`.
+    let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let foreign = start_foreign_origin_server(hits.clone()).await;
+    let page = start_form_page_server(|_| format!("http://{}/collect", foreign)).await;
+
+    let params = discover_form_params(page).await;
+
+    assert_eq!(
+        hits.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "no request may be sent to a cross-origin form action"
+    );
+    assert!(
+        params.is_empty(),
+        "a cross-origin form must not yield discovered params, got {:?}",
+        params
+            .iter()
+            .map(|p| (&p.name, &p.form_action_url))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test]
+async fn test_check_form_discovery_skips_backslash_authority_form_action() {
+    // `http://foreign\@page/submit` resolves — correctly, per WHATWG — to the
+    // authority *before* the backslash, so it reaches `foreign` while reading
+    // as if it named `page`. The gate compares parsed origins precisely so this
+    // cannot slip through; a textual prefix check against the target URL would
+    // let it past.
+    let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let foreign = start_foreign_origin_server(hits.clone()).await;
+    let page = start_form_page_server(|addr| format!("http://{}\\@{}/submit", foreign, addr)).await;
+
+    let params = discover_form_params(page).await;
+
+    assert_eq!(
+        hits.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "a backslash-authority action must not be probed either"
+    );
+    assert!(params.is_empty(), "got {:?}", params);
+}
+
+/// `MAX_FORM_FIELDS` must bound the GET-form branch too. It bounded only the
+/// POST and multipart loops, so a hostile page could serve a GET form with tens
+/// of thousands of inputs and buy one request per input — while the debug log
+/// claimed only the first 200 were probed.
+#[tokio::test]
+async fn test_check_form_discovery_caps_get_form_fields() {
+    const FIELDS: usize = 260;
+
+    let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = hits.clone();
+    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("bind listener");
+    let addr = listener.local_addr().expect("local addr");
+    let inputs: String = (0..FIELDS)
+        .map(|i| format!("<input name=\"f{i}\" value=\"v\">"))
+        .collect();
+    let html =
+        format!("<html><body><form action=\"/s\" method=\"GET\">{inputs}</form></body></html>");
+    let app = Router::new()
+        .route(
+            "/",
+            any(move || {
+                let html = html.clone();
+                async move { html }
+            }),
+        )
+        .route(
+            "/{*rest}",
+            any(move || {
+                let counter = counter.clone();
+                async move {
+                    counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    "no reflection here".to_string()
+                }
+            }),
+        );
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    sleep(Duration::from_millis(20)).await;
+
+    let mut target = parse_target(&format!("http://{}/?q=test", addr)).unwrap();
+    target.delay = 0;
+    let reflection_params = Arc::new(Mutex::new(Vec::<Param>::new()));
+    check_form_discovery(
+        &target,
+        reflection_params.clone(),
+        Arc::new(Semaphore::new(4)),
+    )
+    .await;
+
+    let probed = hits.load(std::sync::atomic::Ordering::SeqCst);
+    assert!(
+        probed <= 201,
+        "a {FIELDS}-field GET form must be capped at MAX_FORM_FIELDS probes \
+         (plus the single JSON-body probe), got {probed}"
+    );
+}
+
+/// Under `--sxss`, form fields are kept even when the write response does not
+/// echo the probe (a stored sink answers "saved"), carrying the form URLs the
+/// stored-XSS stages resolve their check URLs from. Without `--sxss` the same
+/// non-echoing form still yields nothing.
+#[tokio::test]
+async fn test_check_form_discovery_keeps_unreflected_fields_only_when_asked() {
+    use axum::{Router, response::Html, routing::get};
+    let app = Router::new()
+        .route(
+            "/",
+            get(|| async { Html(r#"<form action="/save" method="post"><input name="c"></form>"#) }),
+        )
+        .route("/save", axum::routing::post(|| async { Html("saved") }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    let target = crate::target_parser::parse_target(&format!("http://{addr}/")).expect("target");
+
+    for keep in [false, true] {
+        let params = Arc::new(Mutex::new(Vec::new()));
+        check_form_discovery_with(&target, params.clone(), Arc::new(Semaphore::new(4)), keep).await;
+        let params = params.lock().await;
+        let body: Vec<_> = params
+            .iter()
+            .filter(|p| p.location == Location::Body)
+            .collect();
+        if keep {
+            assert_eq!(body.len(), 1, "{params:?}");
+            assert_eq!(body[0].name, "c");
+            assert_eq!(
+                body[0].form_action_url.as_deref(),
+                Some(format!("http://{addr}/save").as_str())
+            );
+            assert_eq!(
+                body[0].form_origin_url.as_deref(),
+                Some(format!("http://{addr}/").as_str())
+            );
+        } else {
+            assert!(params.is_empty(), "{params:?}");
+        }
+    }
 }

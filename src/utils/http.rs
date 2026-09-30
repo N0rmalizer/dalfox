@@ -77,6 +77,103 @@ pub fn compose_cookie_header_excluding(
     if s.is_empty() { None } else { Some(s) }
 }
 
+/// Same-origin check: scheme, host and port must all match.
+///
+/// Compared on the *parsed* URLs, so authority-confusing spellings
+/// (`http://a\@b/`, userinfo, IDN) are already resolved by WHATWG parsing
+/// before the comparison — a textual prefix check against the target URL would
+/// not survive them. `Url::origin` is what does the comparing: it is exactly
+/// `(scheme, host, port_or_known_default)` for http(s), and yields a unique
+/// opaque origin for schemes with no authority, so two host-less URLs never
+/// compare equal to each other the way a hand-rolled `host_str()` check would.
+pub(crate) fn is_same_origin(a: &Url, b: &Url) -> bool {
+    a.origin() == b.origin()
+}
+
+/// Whether sending the operator's credentials from `page` to `dest` keeps them
+/// on the origin they were meant for.
+///
+/// This is [`is_same_origin`] plus one relaxation: a `http://host/` ->
+/// `https://host/` upgrade on the default ports. The classic "page served over
+/// HTTP, form posts over TLS" shape trips a strict origin check even though the
+/// destination is the same host and strictly better protected, and treating it
+/// as foreign silently drops every parameter on such a form.
+///
+/// 80 -> 443 is of course itself a port change; it is allowed because that pair
+/// *is* the same logical origin by convention, which is not true of ports in
+/// general. So the relaxation is pinned to exactly those two: any other port on
+/// either side stays refused, because a different port on the same host is a
+/// different service with its own auth realm. The reverse direction
+/// (`https` -> `http`) stays refused too, so credentials can never be walked
+/// onto plaintext.
+///
+/// Residual risk, accepted: a host that serves an unrelated application on 443
+/// receives credentials that were configured for the :80 service. A browser
+/// already sends its (non-`Secure`) cookie jar to both, and the alternative is
+/// losing the most common authenticated-form shape on the web.
+///
+/// One predicate governs both the form-action gates and the `--follow-redirects`
+/// policy on purpose: they are the same question (may the operator's
+/// credentials go here?) and this codebase's parallel-implementation history is
+/// that two copies drift. Widening it therefore widens a security control as
+/// well as a recall gate — `target_parser::tests` pins the redirect side
+/// independently so that cannot happen unnoticed.
+pub(crate) fn same_origin_or_tls_upgrade(page: &Url, dest: &Url) -> bool {
+    if is_same_origin(page, dest) {
+        return true;
+    }
+    page.scheme() == "http"
+        && dest.scheme() == "https"
+        && page.host_str() == dest.host_str()
+        && page.port_or_known_default() == Some(80)
+        && dest.port_or_known_default() == Some(443)
+}
+
+/// Resolve a `<form action>` against the page it was found on, returning the URL
+/// to probe -- or `None` when the form must be skipped.
+///
+/// The action attribute is attacker-controlled content: it comes from the
+/// scanned page, not from the operator. Probing a destination the scan may not
+/// send credentials to hands over every credential configured for the run --
+/// `-H` headers, `--cookies`, and any `Authorization`/`Cookie` inherited from a
+/// raw-http or HAR import, all attached unconditionally by
+/// [`apply_headers_ua_cookies`] -- to a host the operator never named. A page
+/// serving `<form action="https://attacker.example/collect">` is enough to
+/// collect the operator's session, and the leak does not stop at the probes: if
+/// that endpoint echoes the probe marker back, the fields are recorded as
+/// discovered parameters and the whole scanning phase then aims there.
+///
+/// [`same_origin_or_tls_upgrade`] is what decides, and it compares *parsed*
+/// origins, which is what makes this hold against authority-confusing actions
+/// such as `http://attacker.example\@target.example/submit`: `join` has already
+/// resolved that to host `attacker.example` (correct WHATWG parsing -- a
+/// backslash terminates the authority in a special scheme), so it compares as
+/// foreign. A textual prefix check against the page URL would not.
+///
+/// The cost is accepted: parameters on a form that legitimately posts to a
+/// different host (a separate API or login host) are not discovered.
+///
+/// Both form-parsing paths -- `parameter_analysis::discovery::form` and the
+/// blind/stored path in `scanning::xss_blind` -- go through here, because they
+/// had independently grown the same resolve-then-gate block and this codebase's
+/// history is that such pairs drift.
+pub(crate) fn resolve_probeable_form_action(page: &Url, action_attr: &str) -> Option<Url> {
+    let resolved = if action_attr.is_empty() || action_attr == "#" {
+        page.clone()
+    } else {
+        page.join(action_attr).ok()?
+    };
+    if !same_origin_or_tls_upgrade(page, &resolved) {
+        crate::dbg_log!(
+            "skipping form action {} on {} (credentials are not sent off-origin)",
+            resolved,
+            page
+        );
+        return None;
+    }
+    Some(resolved)
+}
+
 /// Case-insensitive check if a header exists in a (name, value) vector.
 #[inline]
 pub fn has_header(headers: &[(String, String)], name: &str) -> bool {
@@ -296,12 +393,9 @@ pub(crate) fn content_type_primary(ct: &str) -> Option<String> {
     Some(primary)
 }
 
-/// Allow-list check for HTML-ish content types.
-/// Accepts:
-/// - text/html
-/// - application/xhtml+xml
-/// - text/xml, application/xml
-/// - application/rss+xml, application/atom+xml
+/// Allow-list check for response types that use an HTML document parser.
+/// XHTML is included because its namespace-aware XML document has active HTML
+/// elements; generic XML, feeds, and SVG use different parsers/types.
 #[inline]
 pub(crate) fn is_htmlish_content_type(ct: &str) -> bool {
     let Some(primary) = content_type_primary(ct) else {
@@ -310,14 +404,80 @@ pub(crate) fn is_htmlish_content_type(ct: &str) -> bool {
     if primary == "text/html" {
         return true;
     }
-    matches!(
-        primary.as_str(),
-        "application/xhtml+xml"
-            | "text/xml"
-            | "application/xml"
-            | "application/rss+xml"
-            | "application/atom+xml"
-    )
+    primary == "application/xhtml+xml"
+}
+
+/// Whether the supplied MIME type uses an XML parser when navigated.
+#[inline]
+pub(crate) fn is_xml_content_type(ct: &str) -> bool {
+    let Some(primary) = content_type_primary(ct) else {
+        return false;
+    };
+    primary == "application/xml"
+        || primary == "text/xml"
+        || primary
+            .split_once('/')
+            .is_some_and(|(_, subtype)| subtype.ends_with("+xml"))
+}
+
+/// Whether the bytes would create an active markup document when opened as a
+/// top-level browser navigation. Content-Type alone is insufficient for
+/// missing/invalid types, while XML types must be parsed as XML rather than
+/// recovered as HTML by scraper.
+pub(crate) fn response_has_markup_document(ct: &str, body: &str) -> bool {
+    match content_type_primary(ct).as_deref() {
+        Some("text/html") => true,
+        Some(primary) if is_xml_content_type(primary) => {
+            let document = crate::utils::xml::parse_xml_document(body);
+            crate::utils::xml::document_has_markup_for_content_type(primary, body, &document)
+        }
+        Some("unknown/unknown" | "application/unknown" | "*/*") => body_sniffs_as_html(body),
+        Some(_) => false,
+        None => body_sniffs_as_html(body),
+    }
+}
+
+/// Match the HTML signatures used when a browsing context sniffs a response
+/// with no valid supplied MIME type. In particular, a JSON object containing
+/// `<svg…>` later in a string is not sniffed as HTML, and a bare `<svg>` is not
+/// one of the HTML signatures.
+fn body_sniffs_as_html(body: &str) -> bool {
+    const SIGNATURES: &[&[u8]] = &[
+        b"<!doctype html",
+        b"<html",
+        b"<head",
+        b"<script",
+        b"<iframe",
+        b"<h1",
+        b"<div",
+        b"<font",
+        b"<table",
+        b"<a",
+        b"<style",
+        b"<title",
+        b"<b",
+        b"<body",
+        b"<br",
+        b"<p",
+        b"<!--",
+    ];
+    let header = &body.as_bytes()[..body.len().min(1445)];
+    let mut start = 0;
+    while header
+        .get(start)
+        .is_some_and(|byte| matches!(*byte, b' ' | b'\t' | b'\n' | b'\r' | 0x0c))
+    {
+        start += 1;
+    }
+    let header = &header[start..];
+    SIGNATURES.iter().any(|signature| {
+        header
+            .get(..signature.len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(signature))
+            && header
+                .get(signature.len())
+                .is_some_and(|byte| matches!(*byte, b' ' | b'>'))
+    })
 }
 
 /// True when a response Content-Type declares an executable-JavaScript body
@@ -328,8 +488,10 @@ pub(crate) fn is_htmlish_content_type(ct: &str) -> bool {
 /// payload that executes *as JavaScript* (e.g. a JSONP callback name) is
 /// exploitable there.
 ///
-/// Deliberately excludes `text/plain` and empty/missing types, which browsers
-/// content-sniff into HTML when `X-Content-Type-Options: nosniff` is absent.
+/// Deliberately excludes `text/plain` and empty/missing types: the former is
+/// never parsed as HTML for a top-level navigation, while the latter can only
+/// be classified after checking whether its body matches an HTML sniffing
+/// signature.
 #[inline]
 pub(crate) fn is_javascript_content_type(ct: &str) -> bool {
     let Some(primary) = content_type_primary(ct) else {
@@ -349,11 +511,11 @@ pub(crate) fn is_javascript_content_type(ct: &str) -> bool {
 /// even when they are not directly HTML documents.
 ///
 /// This is intentionally broader than `is_htmlish_content_type` because
-/// browser-executable or browser-consumed responses such as JSONP, raw JSON
-/// fragments, and SVG documents can still surface XSS gadgets or reflective
-/// payloads that Dalfox should analyze during preflight.
+/// JSONP, raw JSON fragments, SVG, generic XML, and plain-text endpoints are
+/// useful scan surfaces. Later finding gates decide whether the response can
+/// execute in the relevant browser context.
 pub(crate) fn is_xss_scannable_content_type(ct: &str) -> bool {
-    if is_htmlish_content_type(ct) {
+    if is_htmlish_content_type(ct) || is_xml_content_type(ct) {
         return true;
     }
 
@@ -371,8 +533,8 @@ pub(crate) fn is_xss_scannable_content_type(ct: &str) -> bool {
             | "text/ecmascript"
             | "application/x-javascript"
             | "image/svg+xml"
-            // text/plain may render as HTML when X-Content-Type-Options is absent
-            // and the response contains HTML-like content (content-type sniffing).
+            // Plain-text endpoints remain useful scan surfaces; body-aware
+            // finding gates suppress them as markup documents.
             | "text/plain"
     )
 }
@@ -382,16 +544,18 @@ pub(crate) fn is_xss_scannable_content_type(ct: &str) -> bool {
 /// script, so a payload reflected into the body is not exploitable as
 /// reflected XSS regardless of the injection context inside it.
 ///
-/// Deliberately a tight deny-list of structured-data / binary types
+/// Deliberately a tight deny-list of structured-data / XML / binary types
 /// (`application/json`, `text/csv`, `application/octet-stream`, fonts, raw
 /// media) rather than the inverse of the HTML allow-list, because the grey
 /// zone must stay *scannable* to avoid false negatives:
 ///   * `application/javascript` / `text/javascript` — a reflected callback
 ///     name is executable when the response is loaded via `<script src>`
 ///     (JSONP injection), so these are NOT inert.
-///   * `text/plain` — browsers content-sniff it as HTML when
-///     `X-Content-Type-Options: nosniff` is absent, so it is NOT inert.
-///   * empty / missing Content-Type — also sniffable, NOT inert.
+///   * `text/plain` is handled after reading the body so browser behavior stays
+///     explicit at the caller; a supplied text/plain type is never sniffed into
+///     HTML, regardless of `X-Content-Type-Options`.
+///   * empty / missing Content-Type is body-dependent: recognized HTML
+///     signatures are sniffed as HTML, while JSON and ordinary text are not.
 pub(crate) fn content_type_is_inert_data(ct: &str) -> bool {
     let Some(primary) = content_type_primary(ct) else {
         return false;

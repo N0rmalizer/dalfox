@@ -21,6 +21,9 @@ pub(crate) const PREFLIGHT_BODY_BYTES: usize = 8192;
 /// Preflight result containing content-type, CSP, body, WAF, and tech detection info.
 pub(crate) struct PreflightResult {
     pub(crate) content_type: String,
+    /// Content-Type from the GET response whose body is captured below. It can
+    /// differ from HEAD on servers that route the methods separately.
+    pub(crate) response_content_type: String,
     pub(crate) csp_header: Option<(String, String)>,
     pub(crate) response_body: Option<String>,
     pub(crate) waf_result: crate::waf::WafDetectionResult,
@@ -41,16 +44,19 @@ pub(crate) struct PreflightResult {
 pub(crate) enum PreflightOutcome {
     /// HEAD/GET preflight returned a response with a usable Content-Type.
     WithContentType(PreflightResult),
-    /// Response was received (e.g. 405 from a POST-only endpoint) but
-    /// no Content-Type header — keep scanning, just without preflight
-    /// metadata (CSP, WAF, tech).
+    /// HEAD returned no Content-Type header — keep scanning and carry the
+    /// GET body/type through for MIME-aware initial-page analysis.
     ///
     /// The session baseline rides along rather than being dropped with the
     /// rest: the target still gets scanned, so it still has a session that can
     /// die, and with `--session-check-url` the extra baseline request has
     /// already been spent. Discarding it silently disabled monitoring the
     /// operator explicitly asked for.
-    NoContentType(Option<super::session::SessionBaseline>),
+    NoContentType {
+        session_baseline: Option<super::session::SessionBaseline>,
+        response_body: Option<String>,
+        response_content_type: String,
+    },
     /// Hard reachability failure — the `&'static str` carries the
     /// specific error_code (`DNS_RESOLUTION_FAILED`,
     /// `TLS_HANDSHAKE_FAILED`, `REQUEST_TIMEOUT`, or
@@ -226,22 +232,6 @@ pub(crate) async fn preflight_content_type(
         .get(CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .map(ToString::to_string);
-    let mut csp_header = head_headers
-        .get("content-security-policy")
-        .and_then(|v| v.to_str().ok())
-        .map(|v| ("Content-Security-Policy".to_string(), v.to_string()))
-        .or_else(|| {
-            head_headers
-                .get("content-security-policy-report-only")
-                .and_then(|v| v.to_str().ok())
-                .map(|v| {
-                    (
-                        "Content-Security-Policy-Report-Only".to_string(),
-                        v.to_string(),
-                    )
-                })
-        });
-
     // Technology detection accumulator
     let mut tech_result = crate::scanning::tech_detect::TechDetectionResult::default();
 
@@ -252,9 +242,11 @@ pub(crate) async fn preflight_content_type(
     // detection too, use `--skip-waf-probe` (no provocation request)
     // or just don't read the `waf` field.
     let mut waf_result = crate::waf::fingerprint_from_response(&head_headers, None, head_status);
+    let mut baseline_status = Some(head_status);
 
     // Always fetch a small body for CSP parsing and AST analysis
     let mut response_body: Option<String> = None;
+    let mut response_content_type = String::new();
     let mut session_baseline: Option<super::session::SessionBaseline> = None;
     let monitor_session = super::session::monitoring_enabled(args, target);
     let get_req =
@@ -262,7 +254,13 @@ pub(crate) async fn preflight_content_type(
     crate::record_outbound_request().await;
     if let Ok(get_resp) = get_req.send().await {
         let get_status = get_resp.status().as_u16();
+        baseline_status = Some(get_status);
         let get_headers = get_resp.headers().clone();
+        response_content_type = get_headers
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("")
+            .to_string();
         // Captured before `read_body` consumes the response. Under
         // `--follow-redirects` this is where the chain actually ended, which is
         // the only thing the session baseline can meaningfully compare against.
@@ -311,20 +309,65 @@ pub(crate) async fn preflight_content_type(
             // Technology/framework detection from GET response
             tech_result =
                 crate::scanning::tech_detect::detect_technologies(&get_headers, Some(&body));
-
-            // Only parse CSP if not already found. Shared with
-            // `PageSecurityPosture::from_response`, which the server / MCP
-            // surfaces use — a page that declares its policy in the document
-            // must be analysed identically on every interface.
-            if csp_header.is_none() {
-                csp_header = crate::scanning::extract_meta_csp(&body);
-            }
         }
     }
 
-    // Provocation probe for stronger WAF detection (costs one extra request)
-    if args.waf_bypass != "off" && !args.skip_waf_probe {
-        let probe_result = crate::waf::fingerprint_with_probe(target, &client).await;
+    // Header policy from the HEAD response, `<meta>` policy from the GET
+    // body, combined with the precedence the server / MCP surfaces use
+    // (`csp_header_from_response`) — a page must be analysed identically on
+    // every interface.
+    let csp_header = crate::scanning::select_csp_policy(&head_headers, || {
+        response_body
+            .as_deref()
+            .and_then(crate::scanning::extract_meta_csp)
+    });
+
+    // The landing page's own status is the probe's baseline: a probe that
+    // merely gets the same blocking status back is not evidence of a WAF.
+    let waf_result = finish_waf_detection(waf_result, baseline_status, target, &client, args).await;
+
+    match ct_opt {
+        Some(ct) => PreflightOutcome::WithContentType(PreflightResult {
+            content_type: ct,
+            response_content_type,
+            csp_header,
+            response_body,
+            waf_result,
+            tech_result,
+            session_baseline,
+        }),
+        None => PreflightOutcome::NoContentType {
+            session_baseline,
+            response_body,
+            response_content_type,
+        },
+    }
+}
+
+/// Parse a WAF type string (from --force-waf) into a WafType enum.
+/// Complete WAF detection from the passive fingerprints of the landing page:
+/// the provocation probe, `--force-waf`, and `--waf-min-confidence`.
+///
+/// Shared by the CLI preflight and the server / MCP job runner
+/// (`job::runner::execute_scan`). The runner used to skip WAF detection
+/// entirely, so `waf_bypass` / `force_waf` / `waf_min_confidence` were accepted
+/// by REST and MCP and then ignored: `compute_waf_strategy` never saw a
+/// fingerprint and a job against a WAF-fronted target ran without a single
+/// bypass mutation, extra encoder or pacing hint.
+pub(crate) async fn finish_waf_detection(
+    mut waf_result: crate::waf::WafDetectionResult,
+    baseline_status: Option<u16>,
+    target: &crate::target_parser::Target,
+    client: &reqwest::Client,
+    args: &ScanArgs,
+) -> crate::waf::WafDetectionResult {
+    // Provocation probe for stronger WAF detection (costs one extra request).
+    // Not under `--dry-run` (nor the REST / MCP preflight, which runs as a
+    // dry run): the probe carries a `<script>` payload, and a dry run promises
+    // to report what would be scanned without sending attack payloads.
+    if args.waf_bypass != "off" && !args.skip_waf_probe && !args.dry_run {
+        let probe_result =
+            crate::waf::fingerprint_with_probe(target, client, baseline_status).await;
         crate::waf::merge_results(&mut waf_result, probe_result);
     }
 
@@ -348,21 +391,9 @@ pub(crate) async fn preflight_content_type(
             .detected
             .retain(|fp| fp.confidence >= args.waf_min_confidence);
     }
-
-    match ct_opt {
-        Some(ct) => PreflightOutcome::WithContentType(PreflightResult {
-            content_type: ct,
-            csp_header,
-            response_body,
-            waf_result,
-            tech_result,
-            session_baseline,
-        }),
-        None => PreflightOutcome::NoContentType(session_baseline),
-    }
+    waf_result
 }
 
-/// Parse a WAF type string (from --force-waf) into a WafType enum.
 fn parse_waf_type(s: &str) -> crate::waf::WafType {
     match s.to_ascii_lowercase().as_str() {
         "cloudflare" | "cf" => crate::waf::WafType::Cloudflare,

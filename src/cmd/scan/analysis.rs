@@ -271,6 +271,7 @@ pub(crate) async fn preflight_and_analyze_target(
         csp_present: __preflight_csp_present,
         csp_header: __preflight_csp_header,
         response_body: preflight_response_body,
+        response_content_type: preflight_response_content_type,
     } = run_target_preflight(
         &mut target,
         &args_clone,
@@ -414,14 +415,18 @@ pub(crate) async fn preflight_and_analyze_target(
         // Check headers
         for (k, v) in &target.headers {
             if v.contains(marker.as_str()) {
-                marker_params.push(Param::new(k.clone(), v.clone(), Location::Header));
+                marker_params.push(
+                    Param::new(k.clone(), v.clone(), Location::Header).with_cookie_identity(false),
+                );
             }
         }
 
         // Check cookies
         for (k, v) in &target.cookies {
             if v.contains(marker.as_str()) {
-                marker_params.push(Param::new(k.clone(), v.clone(), Location::Header));
+                marker_params.push(
+                    Param::new(k.clone(), v.clone(), Location::Header).with_cookie_identity(true),
+                );
             }
         }
 
@@ -447,6 +452,7 @@ pub(crate) async fn preflight_and_analyze_target(
         &target,
         &args_clone,
         preflight_response_body.as_ref(),
+        &preflight_response_content_type,
         &results_clone,
         &findings_count_clone,
     )
@@ -533,6 +539,8 @@ pub(crate) struct PreflightCapture {
     pub(crate) csp_header: Option<(String, String)>,
     /// The landing-page body, reused by the AST DOM pass so it is fetched once.
     pub(crate) response_body: Option<String>,
+    /// Content-Type paired with `response_body`, taken from the GET response.
+    pub(crate) response_content_type: String,
 }
 
 /// Fetch the landing page once and derive everything the later phases need from
@@ -559,6 +567,7 @@ async fn run_target_preflight(
     let mut __preflight_csp_present = false;
     let mut __preflight_csp_header: Option<(String, String)> = None;
     let mut preflight_response_body: Option<String> = None;
+    let mut preflight_response_content_type = String::new();
     // Preflight probe: fetch the landing page for content-type, CSP,
     // WAF, and tech detection, and capture the body (which feeds the
     // initial AST DOM-XSS pass and outdated-lib detection below).
@@ -613,7 +622,13 @@ async fn run_target_preflight(
             // still work. The session baseline is the one piece
             // that must survive: the target still gets scanned, so
             // it still has a session that can die mid-run.
-            PreflightOutcome::NoContentType(baseline) => {
+            PreflightOutcome::NoContentType {
+                session_baseline: baseline,
+                response_body,
+                response_content_type,
+            } => {
+                preflight_response_body = response_body;
+                preflight_response_content_type = response_content_type;
                 if let Some(baseline) = baseline {
                     record_session_baseline(
                         args_clone,
@@ -631,6 +646,7 @@ async fn run_target_preflight(
 
         if let Some(preflight) = __preflight_info {
             preflight_response_body = preflight.response_body;
+            preflight_response_content_type = preflight.response_content_type;
             // Authenticated-state fingerprint for mid-scan
             // session-loss detection. Present only when the target
             // carries credentials (or the operator asked for a
@@ -647,17 +663,9 @@ async fn run_target_preflight(
             }
             if let Some((hn, hv)) = preflight.csp_header {
                 __preflight_csp_present = true;
-                // Analyze CSP and store on target for bypass payload generation
-                let mut csp = crate::payload::xss_csp_bypass::analyze_csp(&hv);
-                // A report-only CSP enforces nothing — it only emits
-                // violation reports — so `require-trusted-types-for`
-                // there must not drive Trusted Types suppression in
-                // the AST analyzer (that would be a false negative).
-                // Bypass-payload fields stay as parsed.
-                if !hn.eq_ignore_ascii_case("content-security-policy") {
-                    csp.report_only = true;
-                    csp.require_trusted_types_for = false;
-                }
+                // Analyze CSP and store on target for bypass payload
+                // generation (report-only policies are neutralized there).
+                let csp = crate::payload::xss_csp_bypass::analyze_csp_from(&hn, &hv);
                 if crate::DEBUG.load(Ordering::Relaxed) {
                     let class = if csp.is_hardened() {
                         "hardened (nonce/hash-only)"
@@ -745,7 +753,16 @@ async fn run_target_preflight(
                 // `target.waf_extra_delay_ms`. This replaces the old blunt
                 // workers=1 / delay=3000 preset, which throttled far harder
                 // than necessary and was trivially fingerprintable.
-                if args_clone.waf_evasion && !args_clone.silence {
+                // Plain + single-target only, like every other preflight
+                // log line: `cprintln!` writes to stdout, so under
+                // `-f json`/`jsonl`/`sarif`/`toml` this line landed ahead of
+                // the document and broke every parser reading stdout, and a
+                // multi-target run renders one progress line instead.
+                if args_clone.waf_evasion
+                    && !args_clone.silence
+                    && args_clone.format == "plain"
+                    && total_targets_copy == 1
+                {
                     let ts = chrono::Local::now().format("%-I:%M%p").to_string();
                     crate::cprintln!(
                         "\x1b[90m{}\x1b[0m \x1b[33mWAF\x1b[0m evasion activated: adaptive jitter + cooldown",
@@ -776,12 +793,14 @@ async fn run_target_preflight(
         csp_present: __preflight_csp_present,
         csp_header: __preflight_csp_header,
         response_body: preflight_response_body,
+        response_content_type: preflight_response_content_type,
     })
 }
 
 /// `--detect-outdated-libs` (opt-in): flag known-vulnerable JS libraries on the
-/// landing page as informational (CWE-1104) findings.
-async fn detect_outdated_libs(
+/// landing page as informational (CWE-1104) findings. Shared with the server /
+/// MCP job runner (`job::runner::execute_scan`).
+pub(crate) async fn detect_outdated_libs(
     target: &Target,
     args_clone: &ScanArgs,
     preflight_response_body: Option<&String>,
@@ -827,6 +846,7 @@ async fn run_initial_ast_pass(
     target: &Target,
     args_clone: &ScanArgs,
     preflight_response_body: Option<&String>,
+    response_content_type: &str,
     results_clone: &Arc<Mutex<Vec<crate::scanning::result::Result>>>,
     findings_count_clone: &Arc<std::sync::atomic::AtomicUsize>,
 ) {
@@ -838,8 +858,9 @@ async fn run_initial_ast_pass(
     if !args_clone.skip_ast_analysis
         && let Some(response_text) = preflight_response_body
     {
-        let ast_batch = crate::scanning::ast_integration::run_initial_ast_dom_analysis(
+        let ast_batch = crate::scanning::ast_integration::run_initial_ast_dom_analysis_for_response(
             response_text,
+            response_content_type,
             target.url.as_str(),
             &target.method,
             crate::scanning::ast_integration::PageSecurityPosture::from_target(target),
@@ -853,7 +874,9 @@ async fn run_initial_ast_pass(
             guard.extend(ast_batch);
             findings_count_clone.fetch_add(added, Ordering::Relaxed);
         }
-        if args_clone.analyze_external_js {
+        if args_clone.analyze_external_js
+            && crate::utils::response_has_markup_document(response_content_type, response_text)
+        {
             let ext_client = target.build_client_or_default();
             let ext_batch = crate::scanning::fetch_and_analyze_external_js(
                 &ext_client,

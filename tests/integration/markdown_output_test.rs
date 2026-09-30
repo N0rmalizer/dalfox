@@ -30,8 +30,11 @@ fn test_markdown_output_single_result() {
     assert!(markdown.contains("**Reflections (R)**: 0"));
 
     // Verify finding details
-    assert!(markdown.contains("### 1. Vulnerability - q (inHTML)"));
+    assert!(markdown.contains("### 1. Vulnerability - `q` (inHTML)"));
     assert!(markdown.contains("| **Type** | V |"));
+    assert!(markdown.contains(
+        "| **Type Description** | Vulnerable - dalfox asserts this input is exploitable; act on it |"
+    ));
     assert!(markdown.contains("| **Parameter** | `q` |"));
     assert!(markdown.contains("| **Method** | GET |"));
     assert!(markdown.contains("| **Severity** | High |"));
@@ -76,8 +79,8 @@ fn test_markdown_output_multiple_results() {
     assert!(markdown.contains("**Reflections (R)**: 1"));
 
     // Verify both findings are present
-    assert!(markdown.contains("### 1. Vulnerability - q (inHTML)"));
-    assert!(markdown.contains("### 2. Reflection - callback (inJS)"));
+    assert!(markdown.contains("### 1. Vulnerability - `q` (inHTML)"));
+    assert!(markdown.contains("### 2. Reflection - `callback` (inJS)"));
 
     // Verify separators
     assert!(markdown.matches("---").count() >= 2);
@@ -167,8 +170,10 @@ fn test_markdown_output_special_characters() {
     // Verify pipe characters are properly escaped in payload and evidence
     assert!(markdown.contains("payload\\|with\\|pipes"));
     assert!(markdown.contains("evidence\\|test"));
-    // Parameter is in code block so doesn't need escaping
-    assert!(markdown.contains("`param|with|pipes`"));
+    // A code span does NOT protect a pipe: GFM still ends the cell there, so
+    // the pipe stays escaped in both the cell and heading.
+    assert!(markdown.contains("`param\\|with\\|pipes`"));
+    assert!(markdown.contains("### 1. Vulnerability - `param\\|with\\|pipes` (inHTML)"));
 }
 
 #[test]

@@ -80,6 +80,66 @@ fn test_query_injection_preserves_existing_percent_encoding() {
 }
 
 #[test]
+fn query_injection_preserves_literal_percent_sequences_in_other_values() {
+    // `query_pairs()` returns decoded values. A literal "%2F" therefore
+    // comes back from the source URL `other=%252F`; reusing the payload
+    // encoder for that decoded value turns it into `/` on the next request.
+    let base = make_url("https://example.com/path?other=%252F&q=seed");
+    let param = Param::new("q", "seed", Location::Query);
+    let out = build_injected_url(&base, &param, "PAY");
+    let parsed = Url::parse(&out).expect("injected URL must parse");
+    let pairs: Vec<(String, String)> = parsed
+        .query_pairs()
+        .map(|(k, v)| (k.into_owned(), v.into_owned()))
+        .collect();
+
+    assert_eq!(
+        pairs,
+        vec![("other".into(), "%2F".into()), ("q".into(), "PAY".into())]
+    );
+}
+
+#[test]
+fn hpp_injection_preserves_literal_percent_sequences() {
+    let base = make_url("https://example.com/path?other=%252F&q=%252F");
+    let param = Param::new("q", "%2F", Location::Query);
+    let out = build_hpp_url(&base, &param, "PAY", HppPosition::Last)
+        .expect("query params have HPP variants");
+    let parsed = Url::parse(&out).expect("injected URL must parse");
+    let pairs: Vec<(String, String)> = parsed
+        .query_pairs()
+        .map(|(k, v)| (k.into_owned(), v.into_owned()))
+        .collect();
+
+    assert_eq!(
+        pairs,
+        vec![
+            ("other".into(), "%2F".into()),
+            ("q".into(), "%2F".into()),
+            ("q".into(), "PAY".into()),
+        ]
+    );
+}
+
+#[test]
+fn query_injection_replaces_every_occurrence_of_a_duplicate_name() {
+    // The scanner stores query params by name, so all wire occurrences must
+    // carry the probe. Otherwise last-value servers never see it when the
+    // first duplicate is changed.
+    let base = make_url("https://example.com/path?q=first&q=last");
+    let param = Param::new("q", "first", Location::Query);
+    let out = build_injected_url(&base, &param, "PAY");
+    let parsed = Url::parse(&out).expect("injected URL must parse");
+    let values: Vec<String> = parsed
+        .query_pairs()
+        .filter(|(k, _)| k == "q")
+        .map(|(_, v)| v.into_owned())
+        .collect();
+
+    assert_eq!(values, vec!["PAY", "PAY"]);
+}
+
+#[test]
 fn test_query_injection_encodes_raw_spaces_without_plus() {
     let base = make_url("https://example.com/path?q=seed");
     let param = Param::new("q", "seed", Location::Query);
@@ -94,6 +154,18 @@ fn test_path_injection_basic() {
     let out = build_injected_url(&base, &param, "PAY LOAD");
     // space should be %20
     assert!(out.contains("/a/PAY%20LOAD/c"));
+}
+
+#[test]
+fn path_injection_preserves_empty_and_trailing_segments() {
+    // Empty path segments and a trailing slash can select different routes.
+    // Replacing one segment must keep the rest of the captured path intact.
+    let base = make_url("https://example.com/a//b/");
+    let param = Param::new("path_segment_0", "a", Location::Path);
+    let out = build_injected_url(&base, &param, "PAY");
+    let parsed = Url::parse(&out).expect("injected URL must parse");
+
+    assert_eq!(parsed.path(), "/PAY//b/");
 }
 
 /// Only the space arm of the path-segment encoder was exercised. The rest of
@@ -1013,5 +1085,106 @@ fn multipart_poc_body_serializes_exactly_the_shared_fields() {
     assert!(
         body.ends_with(&format!("--{boundary}--\r\n")),
         "body:\n{body}"
+    );
+}
+
+/// Both request-building sites that consume a stored `form_action_url` must
+/// refuse a cross-origin one. `check_form_discovery` no longer records such an
+/// action, so these are defence in depth — and without a test, deleting either
+/// predicate is completely silent.
+#[test]
+fn form_action_consumers_ignore_a_cross_origin_action() {
+    let target = make_url("https://example.com/page");
+    let target_obj = crate::target_parser::parse_target("https://example.com/page").unwrap();
+
+    for action in [
+        "https://attacker.example/collect",
+        // Same host, different port and different scheme are both foreign.
+        "https://example.com:8443/collect",
+        "http://example.com/collect",
+        // Authority terminated by a backslash: `Url::parse` resolves the host
+        // to `attacker.example`, which a textual check against the target URL
+        // would miss.
+        "https://attacker.example\\@example.com/collect",
+    ] {
+        let param = Param {
+            form_action_url: Some(action.to_string()),
+            form_origin_url: Some("https://example.com/page".to_string()),
+            ..Param::new("xss", "", Location::Query)
+        };
+
+        assert_eq!(
+            effective_query_base(&target, &param).as_str(),
+            target.as_str(),
+            "effective_query_base must stay on the target for action {action}"
+        );
+        assert_eq!(
+            resolve_form_action_url(&param, &target_obj).as_str(),
+            target.as_str(),
+            "resolve_form_action_url must stay on the target for action {action}"
+        );
+    }
+}
+
+/// The counterpart: a genuinely same-origin action still redirects the probe,
+/// so the guard above cannot be satisfied by simply never honouring an action.
+#[test]
+fn form_action_consumers_still_honour_a_same_origin_action() {
+    let target = make_url("https://example.com/page");
+    let target_obj = crate::target_parser::parse_target("https://example.com/page").unwrap();
+    let param = Param {
+        form_action_url: Some("https://example.com/app.php".to_string()),
+        form_origin_url: Some("https://example.com/page".to_string()),
+        ..Param::new("xss", "", Location::Query)
+    };
+
+    assert_eq!(
+        effective_query_base(&target, &param).as_str(),
+        "https://example.com/app.php"
+    );
+    assert_eq!(
+        resolve_form_action_url(&param, &target_obj).as_str(),
+        "https://example.com/app.php"
+    );
+}
+
+/// A form on an `http://` page that posts to `https://` on the same host is the
+/// classic "page in the clear, credentials over TLS" shape. Discovery records
+/// such an action, so both consumers must honour it — gating them on strict
+/// origin equality would send the payloads to the page URL instead, which is
+/// not where the sink is.
+#[test]
+fn form_action_consumers_follow_a_same_host_tls_upgrade() {
+    let target = make_url("http://example.com/page");
+    let target_obj = crate::target_parser::parse_target("http://example.com/page").unwrap();
+    let param = Param {
+        form_action_url: Some("https://example.com/login".to_string()),
+        form_origin_url: Some("http://example.com/page".to_string()),
+        ..Param::new("xss", "", Location::Query)
+    };
+
+    assert_eq!(
+        effective_query_base(&target, &param).as_str(),
+        "https://example.com/login"
+    );
+    assert_eq!(
+        resolve_form_action_url(&param, &target_obj).as_str(),
+        "https://example.com/login"
+    );
+
+    // The reverse hop stays refused: credentials must not move onto plaintext.
+    let downgrade_target = make_url("https://example.com/page");
+    let downgrade_obj = crate::target_parser::parse_target("https://example.com/page").unwrap();
+    let param = Param {
+        form_action_url: Some("http://example.com/login".to_string()),
+        ..param
+    };
+    assert_eq!(
+        effective_query_base(&downgrade_target, &param).as_str(),
+        downgrade_target.as_str()
+    );
+    assert_eq!(
+        resolve_form_action_url(&param, &downgrade_obj).as_str(),
+        downgrade_target.as_str()
     );
 }

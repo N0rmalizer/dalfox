@@ -43,20 +43,22 @@ mod startup;
 mod state_file;
 mod validation;
 
+pub(crate) use analysis::detect_outdated_libs;
 pub use args::{
     BASELINE_MODE_VALUES, BlindOobArgs, CLI_MAX_DELAY_MS, CLI_MAX_RATE_LIMIT, CLI_MAX_RETRIES,
     CLI_MAX_RETRY_DELAY_MS, CLI_MAX_SXSS_RETRIES, CLI_MAX_TIMEOUT_SECS, CLI_MAX_WORKERS,
     CUSTOM_ALERT_TYPE_VALUES, DEDUP_URLS_VALUES, DEFAULT_DEDUP_URLS, DEFAULT_DELAY_MS,
     DEFAULT_ENCODERS, DEFAULT_MAX_CONCURRENT_TARGETS, DEFAULT_MAX_TARGETS_PER_HOST, DEFAULT_METHOD,
-    DEFAULT_PAYLOAD_SAFETY_CAP, DEFAULT_RATE_LIMIT, DEFAULT_RETRIES, DEFAULT_RETRY_DELAY_MS,
-    DEFAULT_TIMEOUT_SECS, DEFAULT_WAF_BYPASS, DEFAULT_WAF_MIN_CONFIDENCE, DEFAULT_WORKERS,
-    ENCODER_VALUES, ExplicitArgs, FORMAT_VALUES, LIMIT_RESULT_TYPE_VALUES,
-    MAX_PER_PARAM_CONCURRENCY, MAX_SXSS_BACKOFF_MS, ON_SESSION_LOSS_VALUES, ONLY_POC_VALUES,
-    POC_TYPE_VALUES, PREFLIGHT_DEFAULT_WORKERS, PreflightOptions, ScanArgs, WAF_BYPASS_VALUES,
-    format_is_machine,
+    DEFAULT_MINING_BUCKET_SIZE, DEFAULT_PAYLOAD_SAFETY_CAP, DEFAULT_RATE_LIMIT, DEFAULT_RETRIES,
+    DEFAULT_RETRY_DELAY_MS, DEFAULT_TIMEOUT_SECS, DEFAULT_WAF_BYPASS, DEFAULT_WAF_MIN_CONFIDENCE,
+    DEFAULT_WORKERS, ENCODER_VALUES, ExplicitArgs, FORMAT_VALUES, LIMIT_RESULT_TYPE_VALUES,
+    MAX_MINING_BUCKET_SIZE, MAX_PER_PARAM_CONCURRENCY, MAX_SXSS_BACKOFF_MS, MINING_BISECT_WAYS,
+    ON_SESSION_LOSS_VALUES, ONLY_POC_VALUES, POC_TYPE_VALUES, PREFLIGHT_DEFAULT_WORKERS,
+    PreflightOptions, ScanArgs, WAF_BYPASS_VALUES, format_is_machine,
 };
 pub(crate) use args::{parse_force_waf_arg, parse_http_method_arg};
 pub(crate) use logging::log_info;
+pub(crate) use preflight::finish_waf_detection;
 // Shared with `job::normalize_proxy` so REST/MCP refuse the same unroutable
 // proxy values the CLI startup gate does. The CLI wrapper that also rejects
 // empty lives in `validation::validate_proxy_url`.
@@ -109,6 +111,9 @@ pub(crate) struct ScanState {
     /// scan-meta envelope so a run that dropped targets is never mistaken for
     /// full coverage of the input list.
     pub(crate) dedup: input::DedupStats,
+    /// Target-list lines that did not parse and were skipped. Reported for the
+    /// same reason as [`input::DedupStats::collapsed`].
+    pub(crate) unparsable_lines: usize,
     /// `--state-file` handle, when resume is on. Written by the scanning loop
     /// as each target reaches a terminal state, and read at meta-envelope time
     /// for the resume block.
@@ -117,6 +122,12 @@ pub(crate) struct ScanState {
     /// `completed`. Reported alongside the dedup counts for the same reason:
     /// a partial re-run must never read as full coverage of the input list.
     pub(crate) resumed_skipped: usize,
+    /// Keys ([`output::stream_key`]) of the findings the `--stream-findings`
+    /// printer already rendered. End-of-scan rendering prints the rest:
+    /// findings that never pass through `run_scanning` — the initial AST pass,
+    /// external JS, `--detect-outdated-libs`, OOB callbacks — have no stream
+    /// sender, and used to be printed by neither path.
+    pub(crate) streamed_findings: Arc<Mutex<std::collections::HashSet<String>>>,
 }
 
 /// Emit a structured error to stderr when format is json/jsonl, otherwise plain eprintln.
@@ -199,6 +210,7 @@ pub async fn run_scan(args: &ScanArgs) -> ScanOutcome {
     }
     let __dalfox_scan_start = std::time::Instant::now();
     crate::REQUEST_COUNT.store(0, Ordering::Relaxed);
+    crate::REQUEST_FAILURE_COUNT.store(0, Ordering::Relaxed);
 
     // SIGINT (Ctrl-C) handler: dogfood found that long scans ignored the
     // signal entirely, requiring SIGTERM/SIGKILL to stop. Plumb a shared
@@ -259,8 +271,8 @@ pub async fn run_scan(args: &ScanArgs) -> ScanOutcome {
     // Resolve targets: input-type detection, file/stdin/raw-HTTP parsing,
     // dedup, scope + out-of-scope filtering, and --cookie-from-raw. Emits the
     // structured error itself on failure and returns Err for us to propagate.
-    let (mut parsed_targets, dedup) = match input::resolve_targets(args).await {
-        Ok(resolved) => (resolved.targets, resolved.dedup),
+    let (mut parsed_targets, dedup, unparsable_lines) = match input::resolve_targets(args).await {
+        Ok(resolved) => (resolved.targets, resolved.dedup, resolved.unparsable_lines),
         Err(outcome) => return outcome,
     };
 
@@ -322,7 +334,7 @@ pub async fn run_scan(args: &ScanArgs) -> ScanOutcome {
             );
         }
         let before = parsed_targets.len();
-        parsed_targets.retain(|t| !sf.is_completed(t.url.as_str(), &t.method));
+        parsed_targets.retain(|t| !sf.is_completed(t));
         resumed_skipped = before - parsed_targets.len();
         // Report both numbers when they differ: a file holding 5000
         // completions that matches 3 of this run's targets means the input
@@ -488,8 +500,10 @@ pub async fn run_scan(args: &ScanArgs) -> ScanOutcome {
         spinner_allowed,
         no_color: nc,
         dedup,
+        unparsable_lines,
         state_file,
         resumed_skipped,
+        streamed_findings: Arc::new(Mutex::new(std::collections::HashSet::new())),
     };
 
     let oob_session = blind::arm_and_dispatch(args, &host_groups).await;
@@ -497,14 +511,13 @@ pub async fn run_scan(args: &ScanArgs) -> ScanOutcome {
     // Targets entering preflight, so the ones it drops can be told apart from
     // the ones that go on to be scanned. Only materialized when `--state-file`
     // is on — on a 50k-URL list this is two strings per target.
-    let pre_preflight_keys: Vec<(String, String)> = if state.state_file.is_some() {
-        host_groups
+    let pre_preflight_keys: Vec<state_file::TargetIdentity> = match &state.state_file {
+        Some(sf) => host_groups
             .values()
             .flatten()
-            .map(|t| (t.url.to_string(), t.method.clone()))
-            .collect()
-    } else {
-        Vec::new()
+            .map(|t| sf.identity(t))
+            .collect(),
+        None => Vec::new(),
     };
 
     // Preflight + parameter analysis for every target (bounded concurrency);
@@ -521,14 +534,14 @@ pub async fn run_scan(args: &ScanArgs) -> ScanOutcome {
         && !args.dry_run
         && !args.only_discovery
     {
-        let survived: std::collections::HashSet<String> = host_groups
+        let survived: std::collections::HashSet<state_file::TargetIdentity> = host_groups
             .values()
             .flatten()
-            .map(|t| state_file::target_key(t.url.as_str(), &t.method))
+            .map(|t| sf.identity(t))
             .collect();
-        for (url, method) in &pre_preflight_keys {
-            if !survived.contains(&state_file::target_key(url, method)) {
-                sf.record(url, method, state_file::TargetOutcome::Error);
+        for identity in &pre_preflight_keys {
+            if !survived.contains(identity) {
+                sf.record_identity(identity.clone(), state_file::TargetOutcome::Error);
             }
         }
     }
@@ -600,6 +613,19 @@ pub async fn run_scan(args: &ScanArgs) -> ScanOutcome {
         sent: crate::REQUEST_COUNT.load(Ordering::Relaxed),
         failed: crate::REQUEST_FAILURE_COUNT.load(Ordering::Relaxed),
     };
+    // `scan_loop` knows about explicit interruption, session loss, and worker
+    // failures, but request-level transport failures are tallied globally.
+    // When that tally makes the report incomplete, none of the targets can be
+    // safely reused on resume; downgrade each `completed` record this run left
+    // so the latest line is retryable. Targets already recorded `error` or
+    // `cancelled` are retried anyway and are left alone.
+    if requests.is_incomplete()
+        && let Some(sf) = &state.state_file
+    {
+        for identity in &pre_preflight_keys {
+            sf.downgrade_completed(identity.clone());
+        }
+    }
     let (final_results, output_write_failed) = output::render_results(
         args,
         &state,
@@ -629,6 +655,7 @@ pub async fn run_scan(args: &ScanArgs) -> ScanOutcome {
         &all_target_urls,
         &state,
         &final_results,
+        requests,
         output_write_failed,
     )
     .await

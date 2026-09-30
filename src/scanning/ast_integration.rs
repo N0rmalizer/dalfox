@@ -48,11 +48,286 @@ pub(crate) fn extract_javascript_from_html(html: &str) -> Vec<String> {
 /// both for the same response body; calling the two extractors separately
 /// parsed the full response through html5ever twice. Sharing one parse tree
 /// yields byte-identical results at half the HTML-parse cost.
+#[cfg(test)]
 pub(crate) fn extract_js_and_script_ids(html: &str) -> (Vec<String>, HashSet<String>) {
     let document = crate::utils::html::parse_document_bounded(html);
     let js_blocks = js_blocks_from_document(&document);
     let script_ids = script_element_ids_from_document(&document);
     (js_blocks, script_ids)
+}
+
+/// [`extract_js_and_script_ids`] plus the [`PageMarkup`] of the same
+/// parse, for a response whose request carried a scan marker in the tested
+/// parameter.
+///
+/// [`PageMarkup`]: crate::scanning::ast_dom_analysis::PageMarkup
+pub(crate) fn extract_js_script_ids_and_reflected_markup(
+    html: &str,
+) -> (
+    Vec<String>,
+    HashSet<String>,
+    crate::scanning::ast_dom_analysis::PageMarkup,
+) {
+    let document = crate::utils::html::parse_document_bounded(html);
+    let js_blocks = js_blocks_from_document(&document);
+    let script_ids = script_element_ids_from_document(&document);
+    let markup = reflected_markup_from_document(&document, html);
+    (js_blocks, script_ids, markup)
+}
+
+/// [`PageMarkup`] of a probe response, or `None` when it has no script
+/// to read it back or no slot carries a marker. Used by the pre-scan active
+/// probe, whose response is not otherwise kept.
+///
+/// [`PageMarkup`]: crate::scanning::ast_dom_analysis::PageMarkup
+pub(crate) fn reflected_markup_from_html(
+    html: &str,
+) -> Option<crate::scanning::ast_dom_analysis::PageMarkup> {
+    let has_script = html
+        .as_bytes()
+        .windows(7)
+        .any(|w| w.eq_ignore_ascii_case(b"<script"));
+    if !has_script || !carries_scan_marker(html) {
+        return None;
+    }
+    let document = crate::utils::html::parse_document_bounded(html);
+    Some(reflected_markup_from_document(&document, html)).filter(|m| !m.is_empty())
+}
+
+use crate::scanning::markers::carries_scan_marker;
+
+/// Custom-property declarations (`--name: value`) in CSS text whose value
+/// carries a scan marker.
+fn marker_css_custom_properties(css: &str, out: &mut HashSet<String>) {
+    for decl in css.split([';', '{', '}']) {
+        let Some((name, value)) = decl.split_once(':') else {
+            continue;
+        };
+        let name = name.trim();
+        if name.starts_with("--") && carries_scan_marker(value) {
+            out.insert(name.to_string());
+        }
+    }
+}
+
+/// The slots of `document` (parsed from `raw`) that carry a scan marker:
+/// attributes and text of elements with an `id`, and CSS custom properties.
+/// See [`PageMarkup`](crate::scanning::ast_dom_analysis::PageMarkup).
+fn reflected_markup_from_document(
+    document: &Html,
+    raw: &str,
+) -> crate::scanning::ast_dom_analysis::PageMarkup {
+    let mut markup = crate::scanning::ast_dom_analysis::PageMarkup::default();
+    for form in document.select(selectors::form()) {
+        if let Some(id) = form
+            .value()
+            .attr("id")
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            markup.form_ids.insert(id.to_string());
+        }
+    }
+    // Markers are alphanumeric, so entity encoding cannot hide one from the
+    // raw text: no marker there means no slot to find.
+    if !carries_scan_marker(raw) {
+        return markup;
+    }
+    for element in document
+        .root_element()
+        .descendants()
+        .filter_map(scraper::ElementRef::wrap)
+    {
+        let el = element.value();
+        if let Some(style) = el.attr("style") {
+            marker_css_custom_properties(style, &mut markup.css_custom_properties);
+        }
+        if el.name() == "style" {
+            let css: String = element.text().collect();
+            marker_css_custom_properties(&css, &mut markup.css_custom_properties);
+        }
+        let Some(id) = el.attr("id").map(str::trim).filter(|s| !s.is_empty()) else {
+            continue;
+        };
+        for (name, value) in el.attrs() {
+            if carries_scan_marker(value) {
+                markup
+                    .attrs
+                    .entry(id.to_string())
+                    .or_default()
+                    .insert(name.to_ascii_lowercase());
+            }
+        }
+        if carries_scan_marker(&element.text().collect::<String>()) {
+            markup.text.insert(id.to_string());
+        }
+    }
+    markup
+}
+
+/// Extract executable inline JavaScript from a well-formed XML document.
+/// Unlike html5ever, this preserves XML's case-sensitive element and
+/// attribute names, and only considers elements in active XHTML/SVG
+/// namespaces. The caller is responsible for checking the response MIME type
+/// and XML document validity before using this path.
+pub(crate) fn extract_js_and_script_ids_from_xml(xml: &str) -> (Vec<String>, HashSet<String>) {
+    extract_js_and_script_ids_from_xml_document(crate::utils::xml::parse_xml_document(xml))
+}
+
+fn extract_js_and_script_ids_from_xml_document(
+    document: crate::utils::xml::XmlDocument<'_>,
+) -> (Vec<String>, HashSet<String>) {
+    const XHTML_NAMESPACE: &str = "http://www.w3.org/1999/xhtml";
+    const SVG_NAMESPACE: &str = "http://www.w3.org/2000/svg";
+
+    let mut js_blocks = Vec::new();
+    let mut script_ids = HashSet::new();
+    let mut seen = HashSet::new();
+
+    match document {
+        crate::utils::xml::XmlDocument::Parsed(document) => {
+            for node in document.descendants().filter(|node| {
+                node.is_element()
+                    && matches!(
+                        node.tag_name().namespace(),
+                        Some(XHTML_NAMESPACE | SVG_NAMESPACE)
+                    )
+            }) {
+                let tag = node.tag_name();
+                if tag.name() == "script" {
+                    if let Some(id) = node.attribute("id") {
+                        let trimmed = id.trim();
+                        if !trimmed.is_empty() {
+                            script_ids.insert(trimmed.to_string());
+                        }
+                    }
+                    let has_external_source = node.attribute("src").is_some()
+                        || node
+                            .attributes()
+                            .any(|attr| attr.name() == "href" && attr.namespace().is_some());
+                    let script_type = node.attribute("type").unwrap_or("");
+                    if !has_external_source && xml_script_type_is_javascript(script_type) {
+                        let code: String = node
+                            .descendants()
+                            .filter(|child| child.is_text())
+                            .filter_map(|child| child.text())
+                            .collect();
+                        let key = code.trim().to_string();
+                        if !key.is_empty() && seen.insert(key) {
+                            js_blocks.push(code);
+                        }
+                    }
+                }
+
+                for attr in node.attributes() {
+                    let name = attr.name();
+                    let value = attr.value().trim();
+                    if value.is_empty() {
+                        continue;
+                    }
+                    let code = if name.starts_with("on") && name.len() > 2 {
+                        Some(value.to_string())
+                    } else if name == "href"
+                        && (attr.namespace().is_none()
+                            || attr.namespace() == Some("http://www.w3.org/1999/xlink"))
+                        && value
+                            .get(..11)
+                            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("javascript:"))
+                    {
+                        Some(value[11..].trim().to_string())
+                    } else {
+                        None
+                    };
+                    if let Some(code) = code {
+                        let key = code.trim().to_string();
+                        if !key.is_empty() && seen.insert(key) {
+                            js_blocks.push(code);
+                        }
+                    }
+                }
+            }
+        }
+        crate::utils::xml::XmlDocument::Recovered(document)
+            if crate::utils::xml::recovered_xml_has_active_markup(&document) =>
+        {
+            for node in document
+                .document
+                .root_element()
+                .descendent_elements()
+                .filter(|node| crate::utils::xml::recovered_element_is_active_xml(&document, *node))
+            {
+                if !crate::utils::xml::recovered_xml_element_is_complete(&document, node) {
+                    continue;
+                }
+                let element = node.value();
+                if element.name() == "script" {
+                    if let Some(id) = element.attr("id") {
+                        let trimmed = id.trim();
+                        if !trimmed.is_empty() {
+                            script_ids.insert(trimmed.to_string());
+                        }
+                    }
+                    if element.attr("src").is_none() && script_type_is_javascript(element) {
+                        let code: String = node.text().collect();
+                        let key = code.trim().to_string();
+                        if !key.is_empty() && seen.insert(key) {
+                            js_blocks.push(code);
+                        }
+                    }
+                }
+
+                for (name, value) in element.attrs() {
+                    let value = value.trim();
+                    let code = if name.starts_with("on") && name.len() > 2 {
+                        Some(value.to_string())
+                    } else if name == "href"
+                        && value
+                            .get(..11)
+                            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("javascript:"))
+                    {
+                        Some(value[11..].trim().to_string())
+                    } else {
+                        None
+                    };
+                    if let Some(code) = code {
+                        let key = code.trim().to_string();
+                        if !key.is_empty() && seen.insert(key) {
+                            js_blocks.push(code);
+                        }
+                    }
+                }
+            }
+        }
+        crate::utils::xml::XmlDocument::Recovered(_) => {}
+    }
+
+    (js_blocks, script_ids)
+}
+
+fn xml_script_type_is_javascript(script_type: &str) -> bool {
+    let script_type = script_type
+        .trim_matches(|c| matches!(c, '\t' | '\n' | '\u{000C}' | '\r' | ' '))
+        .to_ascii_lowercase();
+    matches!(
+        script_type.as_str(),
+        "" | "module"
+            | "application/ecmascript"
+            | "application/javascript"
+            | "application/x-ecmascript"
+            | "application/x-javascript"
+            | "text/ecmascript"
+            | "text/javascript"
+            | "text/javascript1.0"
+            | "text/javascript1.1"
+            | "text/javascript1.2"
+            | "text/javascript1.3"
+            | "text/javascript1.4"
+            | "text/javascript1.5"
+            | "text/jscript"
+            | "text/livescript"
+            | "text/x-ecmascript"
+            | "text/x-javascript"
+    )
 }
 
 /// Extract JS blocks (inline `<script>` bodies, `on*` handler bodies, and
@@ -126,7 +401,7 @@ fn js_blocks_from_document(document: &Html) -> Vec<String> {
 /// HTML's script preparation rules use a MIME *essence match*, not a
 /// Content-Type parser: parameters such as `; charset=utf-8` are invalid here.
 /// https://html.spec.whatwg.org/multipage/scripting.html#prepare-the-script-element
-fn script_type_is_javascript(element: &scraper::node::Element) -> bool {
+pub(crate) fn script_type_is_javascript(element: &scraper::node::Element) -> bool {
     let script_type = match element.attr("type") {
         Some("") => return true,
         Some(value) => value
@@ -178,7 +453,7 @@ pub(crate) fn extract_same_origin_script_srcs(html: &str, base: &url::Url) -> Ve
             Ok(u) => u,
             Err(_) => continue,
         };
-        if !crate::scanning::xss_blind::is_same_origin(&resolved, base) {
+        if !crate::utils::http::is_same_origin(&resolved, base) {
             continue;
         }
         let key = resolved.as_str().to_string();
@@ -271,39 +546,20 @@ impl PageSecurityPosture {
         Self::from_csp(target.csp_analysis.as_ref())
     }
 
-    /// Server / MCP variant: the CLI gets its `CspAnalysis` from preflight, and
-    /// these surfaces fetch the page themselves — so they must apply the same
-    /// precedence preflight does, or the identical target grades differently
-    /// depending on which interface ran the scan. Enforcing header, then
-    /// report-only header, then a `<meta http-equiv>` policy.
+    /// Posture straight from a response: enforcing header, then report-only
+    /// header, then a `<meta http-equiv>` policy. The server / MCP runner now
+    /// stores the policy on the target (via the same
+    /// `csp_header_from_response` + `analyze_csp_from` pair) and uses
+    /// [`Self::from_target`] like the CLI; this composition keeps the
+    /// precedence directly testable.
+    #[cfg(test)]
     pub(crate) fn from_response(headers: &reqwest::header::HeaderMap, body: &str) -> Self {
-        let header_csp = headers
-            .get("content-security-policy")
-            .and_then(|v| v.to_str().ok())
-            .map(|v| (false, v.to_string()))
-            .or_else(|| {
-                headers
-                    .get("content-security-policy-report-only")
-                    .and_then(|v| v.to_str().ok())
-                    .map(|v| (true, v.to_string()))
-            });
-
-        let (report_only, policy) = match header_csp {
-            Some(found) => found,
-            // Only look at the document when no header carried a policy —
-            // mirroring preflight, where the meta scan is the fallback.
-            None => match crate::scanning::extract_meta_csp(body) {
-                Some((name, content)) => (
-                    !name.eq_ignore_ascii_case("content-security-policy"),
-                    content,
-                ),
-                None => return Self::default(),
-            },
-        };
-
-        let mut csp = crate::payload::xss_csp_bypass::analyze_csp(&policy);
-        csp.report_only = report_only;
-        Self::from_csp(Some(&csp))
+        match crate::scanning::csp_header_from_response(headers, body) {
+            Some((name, policy)) => Self::from_csp(Some(
+                &crate::payload::xss_csp_bypass::analyze_csp_from(&name, &policy),
+            )),
+            None => Self::default(),
+        }
     }
 }
 
@@ -393,6 +649,9 @@ pub(crate) fn grade_ast_finding(
 
     if source_is_url_carried(source) {
         reasons.push("URL-carried source");
+    } else if source.starts_with("markup:") {
+        // The pre-scan saw this request's marker in the slot being read.
+        reasons.push("reads back markup the server filled from the parameter");
     } else if bootstrapped_from_url {
         // The page seeds this non-URL source from a query parameter itself, so
         // no attacker-controlled driver page is needed after all — a link is
@@ -509,6 +768,21 @@ pub(crate) fn generate_dom_xss_poc(source: &str, sink: &str) -> (String, String)
     );
     let attr_url_payload = format!("data:text/javascript,alert(1)/*{}*/", marker);
     let js_eval_payload = format!("alert(1)/*{}*/", marker);
+    // A form action navigates on submit: only a `javascript:` URL runs there
+    // (a top-level `data:` navigation is blocked).
+    if sink == "form.action" {
+        let js_url = format!("javascript:alert(1)//{marker}");
+        let payload = if source.contains("location.hash") {
+            format!("#{js_url}")
+        } else if let Some(param_name) = extract_search_param_key(source) {
+            format!("{param_name}={js_url}")
+        } else if source.contains("location.search") {
+            format!("xss={js_url}")
+        } else {
+            js_url
+        };
+        return (payload, format!("DOM-based XSS via {} to {}", source, sink));
+    }
     let html_payload = format!("<img src=x onerror=alert(1) class={}>", marker);
 
     // Generate payload based on the source type
@@ -1001,7 +1275,13 @@ pub(crate) fn analyze_javascript_for_dom_xss(
     String,
     String,
 )> {
-    analyze_javascript_for_dom_xss_with_html_context(js_code, _url, &HashSet::new(), false)
+    analyze_javascript_for_dom_xss_with_html_context(
+        js_code,
+        _url,
+        &HashSet::new(),
+        &Default::default(),
+        false,
+    )
 }
 
 /// Same as `analyze_javascript_for_dom_xss`, but supplies the AST analyzer
@@ -1017,6 +1297,7 @@ pub(crate) fn analyze_javascript_for_dom_xss_with_html_context(
     js_code: &str,
     _url: &str,
     script_element_ids: &HashSet<String>,
+    reflected_markup: &crate::scanning::ast_dom_analysis::PageMarkup,
     trusted_types_enforced: bool,
 ) -> Vec<(
     crate::scanning::ast_dom_analysis::DomXssVulnerability,
@@ -1025,6 +1306,7 @@ pub(crate) fn analyze_javascript_for_dom_xss_with_html_context(
 )> {
     let analyzer = crate::scanning::ast_dom_analysis::AstDomAnalyzer::new()
         .with_script_element_ids(script_element_ids.clone())
+        .with_reflected_markup(reflected_markup.clone())
         .with_trusted_types_enforced(trusted_types_enforced);
 
     match analyzer.analyze(js_code) {
@@ -1128,19 +1410,58 @@ pub(crate) fn build_ast_dom_xss_result(
 /// CLI does — they previously skipped it because they didn't run the
 /// preflight step that produced the response body, so identical
 /// targets produced 0 findings via API but multiple via CLI.
+#[cfg(test)]
 pub(crate) fn run_initial_ast_dom_analysis(
     response_text: &str,
     target_url: &str,
     target_method: &str,
     posture: PageSecurityPosture,
 ) -> Vec<crate::scanning::result::Result> {
-    let (js_blocks, script_element_ids) = extract_js_and_script_ids(response_text);
+    run_initial_ast_dom_analysis_for_response(
+        response_text,
+        "text/html",
+        target_url,
+        target_method,
+        posture,
+    )
+}
+
+/// Run initial-page AST analysis only when the response is a browser-active
+/// markup document. `text/html` and sniffable unknown types use the HTML
+/// parser; XML response types use the namespace-aware XML extractor.
+pub(crate) fn run_initial_ast_dom_analysis_for_response(
+    response_text: &str,
+    content_type: &str,
+    target_url: &str,
+    target_method: &str,
+    posture: PageSecurityPosture,
+) -> Vec<crate::scanning::result::Result> {
+    // An unmarked body: the markup only contributes element facts (form ids).
+    let (js_blocks, script_element_ids, page_markup) =
+        if crate::utils::is_xml_content_type(content_type) {
+            let document = crate::utils::xml::parse_xml_document(response_text);
+            if !crate::utils::xml::document_has_markup_for_content_type(
+                content_type,
+                response_text,
+                &document,
+            ) {
+                return Vec::new();
+            }
+            let (js_blocks, script_ids) = extract_js_and_script_ids_from_xml_document(document);
+            (js_blocks, script_ids, Default::default())
+        } else {
+            if !crate::utils::response_has_markup_document(content_type, response_text) {
+                return Vec::new();
+            }
+            extract_js_script_ids_and_reflected_markup(response_text)
+        };
     let mut out: Vec<crate::scanning::result::Result> = Vec::new();
     for js_code in js_blocks {
         let findings = analyze_javascript_for_dom_xss_with_html_context(
             &js_code,
             target_url,
             &script_element_ids,
+            &page_markup,
             posture.trusted_types_enforced,
         );
         for (vuln, payload, description) in findings {

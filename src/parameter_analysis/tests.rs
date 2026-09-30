@@ -1124,6 +1124,47 @@ async fn active_probe_does_not_record_an_echo_from_an_inert_content_type() {
     );
 }
 
+#[tokio::test]
+async fn active_probe_marks_reflected_unnamespaced_xml_for_small_namespace_family() {
+    use axum::{Router, extract::Query, response::IntoResponse, routing::get};
+    use std::collections::HashMap;
+    use std::net::Ipv4Addr;
+    use tokio::time::{Duration, sleep};
+
+    async fn xml_echo(Query(p): Query<HashMap<String, String>>) -> impl IntoResponse {
+        let value = p.get("x").cloned().unwrap_or_default();
+        (
+            [("content-type", "text/xml; charset=utf-8")],
+            format!("<root>{value}</root>"),
+        )
+    }
+
+    let app = Router::new().route("/xml", get(xml_echo));
+    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("bind test listener");
+    let addr = listener.local_addr().expect("local addr");
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("serve test app");
+    });
+    sleep(Duration::from_millis(20)).await;
+
+    let target = parse_target(&format!("http://{addr}/xml?x=1")).unwrap();
+    let mut param = probe_param("x", Location::Query);
+    param.injection_context = Some(InjectionContext::Html(None));
+    let res = active_probe_param(&target, param, Arc::new(Semaphore::new(8))).await;
+
+    assert!(
+        !res.marker_echoed,
+        "an unnamespaced XML echo is not yet an executable markup document"
+    );
+    assert_eq!(
+        res.xml_namespace_candidate.as_deref(),
+        Some("text/xml; charset=utf-8"),
+        "retain the echoed parameter for the small namespace-activating payload family"
+    );
+}
+
 /// Path parameters keep their Stage-0 probe: the path suppressions
 /// (`should_suppress_path_reflection_with_body`, the non-2xx error-page rule)
 /// need the body, which this cheap content-type check cannot stand in for.
@@ -1993,6 +2034,19 @@ fn one_analysis_applies_identically_to_many_params() {
     }
 }
 
+#[test]
+fn marker_specific_analysis_keeps_batched_contexts_separate() {
+    let body = r#"<script>const js = 'mfirst';</script><div>msecond</div>"#;
+    let js = ReflectionAnalysis::of_with_marker(body, "mfirst");
+    let html = ReflectionAnalysis::of_with_marker(body, "msecond");
+
+    assert_eq!(
+        js.injection_context,
+        InjectionContext::Javascript(Some(DelimiterType::SingleQuote))
+    );
+    assert_eq!(html.injection_context, InjectionContext::Html(None));
+}
+
 /// A server that case-normalizes the reflection (Rails-style `titleize`,
 /// `upcase`, `downcase` template filters) still echoes every special character
 /// raw. Matching the probe markers case-sensitively made
@@ -2036,4 +2090,122 @@ fn test_body_has_probe_marker_is_case_insensitive() {
     let open = crate::scanning::markers::open_marker();
     assert!(body_has_probe_marker(&open.to_ascii_uppercase()));
     assert!(!body_has_probe_marker("nothing reflected here"));
+}
+
+/// When the probe echoes, the slots holding its marker ride on the `Param`:
+/// Stage 0 is then skipped, and the attack response the AST pass analyses
+/// instead has usually broken out of the very attribute it would need to
+/// prove. Only pages with script get it — there is nothing to read it back.
+#[tokio::test]
+async fn active_probe_carries_the_reflected_markup_slots() {
+    use axum::{Router, extract::Query, response::Html, routing::get};
+    use std::collections::HashMap;
+    use std::net::Ipv4Addr;
+    use tokio::time::{Duration, sleep};
+
+    async fn with_script(Query(p): Query<HashMap<String, String>>) -> Html<String> {
+        let v = p
+            .get("x")
+            .cloned()
+            .unwrap_or_default()
+            .replace('"', "&quot;");
+        Html(format!(
+            r#"<div id="t" data-content="{v}"></div><script>t.innerHTML = t.dataset.content;</script>"#
+        ))
+    }
+    async fn no_script(Query(p): Query<HashMap<String, String>>) -> Html<String> {
+        let v = p
+            .get("x")
+            .cloned()
+            .unwrap_or_default()
+            .replace('"', "&quot;");
+        Html(format!(r#"<div id="t" data-content="{v}"></div>"#))
+    }
+
+    let app = Router::new()
+        .route("/s", get(with_script))
+        .route("/n", get(no_script));
+    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("bind test listener");
+    let addr = listener.local_addr().expect("local addr");
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("serve test app");
+    });
+    sleep(Duration::from_millis(20)).await;
+
+    let probe = |path: &str| {
+        let target = parse_target(&format!("http://{addr}{path}?x=1")).unwrap();
+        async move {
+            active_probe_param(
+                &target,
+                probe_param("x", Location::Query),
+                Arc::new(Semaphore::new(8)),
+            )
+            .await
+        }
+    };
+    let res = probe("/s").await;
+    assert!(res.marker_echoed);
+    let markup = res
+        .reflected_markup
+        .expect("the proven slot rides on the param");
+    assert!(markup.attrs["t"].contains("data-content"));
+
+    let res = probe("/n").await;
+    assert!(res.marker_echoed);
+    assert!(
+        res.reflected_markup.is_none(),
+        "no script, nothing to carry"
+    );
+}
+
+/// Part of `--sxss` support: when the write endpoint does not echo the probe
+/// (the common "saved" / redirect / JSON-ack stored sink), the active probe
+/// records every special character as filtered. The adaptive prune would then
+/// drop every `<`/`>`/quote payload before the retrieval URL is ever checked.
+/// Under `--sxss` that verdict — derived from a page that never rendered the
+/// value — is discarded so the full payload set still runs.
+#[tokio::test]
+async fn sxss_discards_the_no_echo_special_char_verdict() {
+    use axum::{Router, routing::post};
+    use std::net::Ipv4Addr;
+    use tokio::time::{Duration, sleep};
+
+    // A write endpoint that never echoes the submitted value.
+    let app = Router::new().route("/save", post(|| async { "saved" }));
+    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("serve");
+    });
+    sleep(Duration::from_millis(20)).await;
+
+    let mut target = parse_target(&format!("http://{addr}/save")).unwrap();
+    target.method = "POST".to_string();
+    target.data = Some("c=seed".to_string());
+    target.workers = 1;
+    let mut param = probe_param("c", Location::Body);
+    param.injection_context = Some(InjectionContext::Html(None));
+    target.reflection_params.push(param);
+
+    let mut args = default_scan_args();
+    args.sxss = true;
+    args.sxss_url = Some(format!("http://{addr}/save"));
+
+    analyze_parameters(&mut target, &args, None).await;
+
+    let c = target
+        .reflection_params
+        .iter()
+        .find(|p| p.name == "c")
+        .expect("param c survives analysis");
+    // The all-invalid verdict from the non-echoing write is cleared, not kept.
+    assert!(
+        c.invalid_specials.as_ref().is_none_or(|v| v.is_empty()),
+        "no-echo special-char verdict must be discarded under --sxss, got {:?}",
+        c.invalid_specials
+    );
 }

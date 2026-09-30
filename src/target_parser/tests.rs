@@ -349,3 +349,237 @@ fn test_parse_target_with_method_body_with_spaces() {
     assert_eq!(target.url.as_str(), "https://example.com/api");
     assert_eq!(target.data, Some("name=John Doe".to_string()));
 }
+
+/// End-to-end proof that `--follow-redirects` cannot be used to walk the
+/// operator's credentials onto a host they never named.
+///
+/// Two hops matter here, not one. The transport strips `Authorization` and
+/// `Cookie` on a hop that changes host, but it rebuilds every redirected
+/// request from the original header map and compares only against the
+/// *immediately preceding* hop — so `target -> attacker/a -> attacker/b`
+/// restores the full credential set on that second, same-host hop. Custom
+/// credential headers (`-H "X-Api-Key: ..."`) are never stripped at all, so
+/// they would leak on the very first hop.
+#[tokio::test]
+async fn follow_redirects_stops_before_leaving_the_target_origin() {
+    use axum::Router;
+    use axum::routing::any;
+    use std::net::{Ipv4Addr, SocketAddr};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    async fn serve(app: Router) -> SocketAddr {
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind listener");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        addr
+    }
+
+    let hits = Arc::new(AtomicUsize::new(0));
+    let leaked = Arc::new(AtomicUsize::new(0));
+
+    // The foreign host: counts every request and every credential it sees,
+    // and bounces once more within itself to reach the second hop.
+    let (h, l) = (hits.clone(), leaked.clone());
+    let foreign = serve(Router::new().route(
+        "/{*rest}",
+        any(
+            move |headers: axum::http::HeaderMap, uri: axum::http::Uri| {
+                let (h, l) = (h.clone(), l.clone());
+                async move {
+                    h.fetch_add(1, Ordering::SeqCst);
+                    for name in ["authorization", "cookie", "x-api-key"] {
+                        if headers.contains_key(name) {
+                            l.fetch_add(1, Ordering::SeqCst);
+                        }
+                    }
+                    if uri.path().contains("first") {
+                        axum::response::Response::builder()
+                            .status(302)
+                            .header("Location", "/second")
+                            .body(axum::body::Body::empty())
+                            .expect("build redirect")
+                    } else {
+                        axum::response::Response::builder()
+                            .status(200)
+                            .body(axum::body::Body::from("landed"))
+                            .expect("build ok")
+                    }
+                }
+            },
+        ),
+    ))
+    .await;
+
+    // The scan target: bounces straight off-origin, plus one same-origin
+    // bounce used as the control.
+    let foreign_url = format!("http://{}/first", foreign);
+    let target_srv = serve(Router::new().route(
+        "/{*rest}",
+        any(move |uri: axum::http::Uri| {
+            let foreign_url = foreign_url.clone();
+            async move {
+                let location = if uri.path().contains("offsite") {
+                    foreign_url.clone()
+                } else if uri.path().contains("samehop") {
+                    "/landing".to_string()
+                } else {
+                    return axum::response::Response::builder()
+                        .status(200)
+                        .body(axum::body::Body::from("LANDED_ON_TARGET"))
+                        .expect("build ok");
+                };
+                axum::response::Response::builder()
+                    .status(302)
+                    .header("Location", location)
+                    .body(axum::body::Body::empty())
+                    .expect("build redirect")
+            }
+        }),
+    ))
+    .await;
+
+    let mut target = parse_target(&format!("http://{}/offsite", target_srv)).unwrap();
+    target.follow_redirects = true;
+    target.headers = vec![
+        ("Authorization".to_string(), "Bearer SECRET".to_string()),
+        ("X-Api-Key".to_string(), "SECRET".to_string()),
+    ];
+    target.cookies = vec![("session".to_string(), "SECRET".to_string())];
+    // A timeout no other cache test uses, so this doesn't perturb their counts.
+    target.timeout = 47;
+
+    let client = target.build_client().expect("build client");
+    let req = crate::utils::build_request(
+        &client,
+        &target,
+        reqwest::Method::GET,
+        target.url.clone(),
+        None,
+    );
+    let _ = req.send().await;
+
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        0,
+        "the redirect chain must stop before reaching the foreign origin"
+    );
+    assert_eq!(
+        leaked.load(Ordering::SeqCst),
+        0,
+        "no operator credential may reach the foreign origin"
+    );
+
+    // Control: a same-origin redirect is still followed, so the assertions
+    // above cannot be satisfied by redirects simply being off.
+    let mut same = target.clone();
+    same.url = url::Url::parse(&format!("http://{}/samehop", target_srv)).unwrap();
+    let client = same.build_client().expect("build client");
+    let body =
+        crate::utils::build_request(&client, &same, reqwest::Method::GET, same.url.clone(), None)
+            .send()
+            .await
+            .expect("same-origin request")
+            .text()
+            .await
+            .expect("body");
+    assert!(
+        body.contains("LANDED_ON_TARGET"),
+        "a same-origin redirect must still be followed, got: {body}"
+    );
+}
+
+/// The redirect policy shares its destination predicate with the form-action
+/// gates, which is deliberate — they answer the same question and two copies
+/// would drift. The risk of sharing is that a widening motivated by scan recall
+/// silently widens a security control, so the invariants that matter *here* are
+/// pinned here: a redirect may not carry the operator's credentials to another
+/// host, to another port, or down onto plaintext.
+#[test]
+fn redirect_destination_predicate_stays_narrow() {
+    let u = |s: &str| Url::parse(s).unwrap();
+    let ok = crate::utils::http::same_origin_or_tls_upgrade;
+
+    assert!(ok(
+        &u("http://target.example/a"),
+        &u("http://target.example/b")
+    ));
+    assert!(ok(
+        &u("http://target.example/a"),
+        &u("https://target.example/b")
+    ));
+
+    for (from, to, why) in [
+        (
+            "http://target.example/a",
+            "http://attacker.example/b",
+            "another host",
+        ),
+        (
+            "http://target.example/a",
+            "http://sub.target.example/b",
+            "a subdomain is another host",
+        ),
+        (
+            "http://target.example:8765/a",
+            "http://target.example:9988/b",
+            "another port",
+        ),
+        (
+            "https://target.example/a",
+            "http://target.example/b",
+            "a downgrade onto plaintext",
+        ),
+    ] {
+        assert!(
+            !ok(&u(from), &u(to)),
+            "a redirect must not carry credentials to {why}: {from} -> {to}"
+        );
+    }
+}
+
+#[test]
+fn authority_less_schemes_are_rejected_not_rewritten() {
+    // A crawl dump's `mailto:` / `javascript:` / `tel:` lines have no HTTP
+    // authority, so prefixing `http://` invented one from the path:
+    // `mailto:security@corp.example` became a scan of `corp.example` carrying
+    // `mailto`/`security` as basic-auth credentials.
+    for s in [
+        "mailto:security@corp.example",
+        "MAILTO:security@corp.example",
+        "javascript:alert(1)",
+        "tel:+15551234567",
+        "data:text/html,<b>x",
+        "about:blank",
+        "intent:#Intent;end",
+    ] {
+        let err = parse_target(s).expect_err("{s} should be rejected");
+        assert!(
+            err.to_string().contains("unsupported URL scheme"),
+            "{s}: {err}"
+        );
+    }
+}
+
+#[test]
+fn scheme_less_inputs_with_a_colon_still_parse() {
+    // The rejection is a fixed scheme list, not a shape rule, precisely so
+    // these keep working: `user:pass@host` is structurally `scheme:rest`.
+    for (s, host) in [
+        ("user:pass@example.com", "example.com"),
+        ("example.com:8080/x", "example.com"),
+        ("127.0.0.1:8080", "127.0.0.1"),
+        // Container/service hostnames that collide with a listed scheme: a
+        // digit after the colon is a port, never a non-hierarchical URI body.
+        ("data:8080/?q=1", "data"),
+        ("news:3000", "news"),
+        ("market:8080/x", "market"),
+    ] {
+        let t = parse_target(s).unwrap_or_else(|e| panic!("{s} should parse: {e}"));
+        assert_eq!(t.url.host_str(), Some(host), "{s}");
+    }
+}

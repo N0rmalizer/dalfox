@@ -114,6 +114,19 @@ pub use super::session::{DEFAULT_ON_SESSION_LOSS, ON_SESSION_LOSS_VALUES};
 pub const DEFAULT_TIMEOUT_SECS: u64 = 10;
 pub const DEFAULT_DELAY_MS: u64 = 0;
 pub const DEFAULT_WORKERS: usize = 50;
+/// Number of query-parameter names carried by one dictionary/DOM mining
+/// request before the positive bucket is split. Bucketing is the main request
+/// reduction lever for large wordlists; 64 stays below common request-line
+/// limits for ordinary parameter names while still amortising one RTT across
+/// many candidates.
+pub const DEFAULT_MINING_BUCKET_SIZE: usize = 64;
+/// Hard ceiling for adaptive query-mining buckets. The current engine starts
+/// at [`DEFAULT_MINING_BUCKET_SIZE`] and never exceeds this value when a
+/// future request-budget heuristic widens the bucket.
+pub const MAX_MINING_BUCKET_SIZE: usize = 128;
+/// Branch factor for positive mining buckets. Four-way splitting reduces the
+/// bisection depth without increasing the request count for a sparse hit.
+pub const MINING_BISECT_WAYS: usize = 4;
 
 /// Worker count preflight analysis runs at when the caller does not ask for one.
 ///
@@ -616,7 +629,9 @@ pub struct ScanArgs {
     #[clap(help_heading = "NETWORK")]
     /// Skip TLS/SSL certificate verification, accepting self-signed, expired,
     /// or hostname-mismatched certs. Enabled by default for scanner use; pass
-    /// `--insecure=false` to enforce certificate validation. Example: --insecure=false
+    /// `--insecure=false` to enforce certificate validation. Applies to the
+    /// scan target and to an OAST server named with `--blind-oob=`; the public
+    /// interactsh mesh is always verified. Example: --insecure=false
     ///
     /// Stored as Option so presence is distinguishable from the default:
     /// `None` means the user didn't pass the flag (config may set it; the
@@ -1092,11 +1107,14 @@ impl ScanArgs {
             wait_secs: self.blind_oob_wait(),
             timeout: self.timeout,
             proxy: self.proxy.clone(),
-            // Mirror the scanner-wide insecure-by-default TLS posture: every
-            // other consumer of `insecure` resolves `None` -> true (see
-            // input.rs / mod.rs). Enforcing validation only on the OOB client
-            // silently disabled blind-OOB against self-hosted interactsh
-            // servers presenting self-signed/mismatched certs.
+            // The scanner-wide insecure-by-default posture, resolved the same
+            // way every other consumer of `insecure` resolves it (`None` ->
+            // true; see input.rs / mod.rs). It is *not* applied wholesale to
+            // the OAST channel: `interactsh::accept_invalid_certs` honours it
+            // only for a server the operator named with `--blind-oob` (the
+            // self-hosted, self-signed-certificate case this default exists
+            // for) and always verifies the public mesh, which carries our
+            // `--blind-oob-secret` and session secret_key.
             insecure: self.insecure.unwrap_or(true),
         }
     }

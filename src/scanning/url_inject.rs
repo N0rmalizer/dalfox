@@ -23,13 +23,14 @@ fn is_hex(byte: u8) -> bool {
     byte.is_ascii_hexdigit()
 }
 
-/// Percent-encode a query component directly into `out`, preserving existing `%XX` sequences.
-fn encode_query_component_preserving_pct_into(raw: &str, out: &mut String) {
+/// Percent-encode a query component directly into `out`.
+fn encode_query_component_into(raw: &str, out: &mut String, preserve_pct: bool) {
     let bytes = raw.as_bytes();
     let mut idx = 0;
 
     while idx < bytes.len() {
-        if bytes[idx] == b'%'
+        if preserve_pct
+            && bytes[idx] == b'%'
             && idx + 2 < bytes.len()
             && is_hex(bytes[idx + 1])
             && is_hex(bytes[idx + 2])
@@ -54,6 +55,45 @@ fn encode_query_component_preserving_pct_into(raw: &str, out: &mut String) {
         }
         idx += ch.len_utf8();
     }
+}
+
+/// Encode a decoded query component. Existing URL components come from
+/// `Url::query_pairs()`, which has already decoded `%25`; their literal percent
+/// signs must be escaped again rather than treated as preserved wire encoding.
+fn encode_decoded_query_component_into(raw: &str, out: &mut String) {
+    encode_query_component_into(raw, out, false);
+}
+
+/// Encode an injected query component while preserving valid `%XX` sequences.
+/// Payload encoders can intentionally hand this function pre-escaped bytes.
+fn encode_query_component_preserving_pct_into(raw: &str, out: &mut String) {
+    encode_query_component_into(raw, out, true);
+}
+
+/// Replace the zero-based `idx`th non-empty path segment without changing any
+/// empty segments, leading slash, or trailing slash in `path`.
+pub(crate) fn replace_nonempty_path_segment(
+    path: &str,
+    idx: usize,
+    replacement: &str,
+) -> Option<String> {
+    let mut segment_idx = 0;
+    let mut result = String::with_capacity(path.len() + replacement.len());
+    for (part_idx, part) in path.split('/').enumerate() {
+        if part_idx > 0 {
+            result.push('/');
+        }
+        if part.is_empty() {
+            continue;
+        }
+        if segment_idx == idx {
+            result.push_str(replacement);
+        } else {
+            result.push_str(part);
+        }
+        segment_idx += 1;
+    }
+    (idx < segment_idx).then_some(result)
 }
 
 /// Selectively encode a path segment for readability while preserving most characters
@@ -93,7 +133,10 @@ fn selective_path_segment_encode(raw: &str) -> Cow<'_, str> {
 /// reflecting at the action URL.
 ///
 /// For non-Query locations and for params without a `form_action_url`, the
-/// caller's `target_url` is returned unchanged.
+/// caller's `target_url` is returned unchanged. An action the scan may not send
+/// credentials to is likewise ignored -- see [`resolve_form_action_url`] for why
+/// every site that turns a stored action back into a request URL repeats that
+/// check.
 pub(crate) fn effective_query_base(target_url: &url::Url, param: &Param) -> url::Url {
     let uses_form_action = matches!(
         param.location,
@@ -102,6 +145,7 @@ pub(crate) fn effective_query_base(target_url: &url::Url, param: &Param) -> url:
     if uses_form_action
         && let Some(ref action) = param.form_action_url
         && let Ok(parsed) = url::Url::parse(action)
+        && crate::utils::http::same_origin_or_tls_upgrade(target_url, &parsed)
     {
         return parsed;
     }
@@ -193,9 +237,9 @@ pub(crate) fn build_injected_url(base: &url::Url, param: &Param, injected: &str)
                         result.push('&');
                     }
                     first = false;
-                    encode_query_component_preserving_pct_into(&k, &mut result);
+                    encode_decoded_query_component_into(&k, &mut result);
                     result.push('=');
-                    encode_query_component_preserving_pct_into(&v, &mut result);
+                    encode_decoded_query_component_into(&v, &mut result);
                 }
                 if !first {
                     result.push('&');
@@ -210,23 +254,20 @@ pub(crate) fn build_injected_url(base: &url::Url, param: &Param, injected: &str)
                         result.push('&');
                     }
                     first = false;
-                    encode_query_component_preserving_pct_into(&k, &mut result);
+                    encode_decoded_query_component_into(&k, &mut result);
                     result.push('=');
-                    if k == param.effective_wire_name() && !found {
+                    if k == param.effective_wire_name() {
                         encode_query_component_preserving_pct_into(injected, &mut result);
                         found = true;
                     } else {
-                        encode_query_component_preserving_pct_into(&v, &mut result);
+                        encode_decoded_query_component_into(&v, &mut result);
                     }
                 }
                 if !found {
                     if !first {
                         result.push('&');
                     }
-                    encode_query_component_preserving_pct_into(
-                        param.effective_wire_name(),
-                        &mut result,
-                    );
+                    encode_decoded_query_component_into(param.effective_wire_name(), &mut result);
                     result.push('=');
                     encode_query_component_preserving_pct_into(injected, &mut result);
                 }
@@ -245,22 +286,9 @@ pub(crate) fn build_injected_url(base: &url::Url, param: &Param, injected: &str)
                 let original_path = url.path().to_string();
                 if original_path != "/" {
                     let encoded = selective_path_segment_encode(injected);
-                    let mut new_path = String::with_capacity(original_path.len() + encoded.len());
-                    let segments = original_path
-                        .trim_matches('/')
-                        .split('/')
-                        .filter(|s| !s.is_empty());
-                    let mut count = 0;
-                    for (i, segment) in segments.enumerate() {
-                        new_path.push('/');
-                        if i == idx {
-                            new_path.push_str(&encoded);
-                        } else {
-                            new_path.push_str(segment);
-                        }
-                        count = i + 1;
-                    }
-                    if idx < count {
+                    if let Some(new_path) =
+                        replace_nonempty_path_segment(&original_path, idx, &encoded)
+                    {
                         url.set_path(&new_path);
                     }
                 }
@@ -416,11 +444,11 @@ pub(crate) fn build_hpp_url(
                         result.push('&');
                     }
                     first = false;
-                    encode_query_component_preserving_pct_into(&k, &mut result);
+                    encode_decoded_query_component_into(&k, &mut result);
                     result.push('=');
-                    encode_query_component_preserving_pct_into(safe_value, &mut result);
+                    encode_decoded_query_component_into(safe_value, &mut result);
                     result.push('&');
-                    encode_query_component_preserving_pct_into(&k, &mut result);
+                    encode_decoded_query_component_into(&k, &mut result);
                     result.push('=');
                     encode_query_component_preserving_pct_into(injected, &mut result);
                 }
@@ -430,13 +458,13 @@ pub(crate) fn build_hpp_url(
                         result.push('&');
                     }
                     first = false;
-                    encode_query_component_preserving_pct_into(&k, &mut result);
+                    encode_decoded_query_component_into(&k, &mut result);
                     result.push('=');
                     encode_query_component_preserving_pct_into(injected, &mut result);
                     result.push('&');
-                    encode_query_component_preserving_pct_into(&k, &mut result);
+                    encode_decoded_query_component_into(&k, &mut result);
                     result.push('=');
-                    encode_query_component_preserving_pct_into(safe_value, &mut result);
+                    encode_decoded_query_component_into(safe_value, &mut result);
                 }
                 HppPosition::Both => {
                     // payload in both positions
@@ -444,11 +472,11 @@ pub(crate) fn build_hpp_url(
                         result.push('&');
                     }
                     first = false;
-                    encode_query_component_preserving_pct_into(&k, &mut result);
+                    encode_decoded_query_component_into(&k, &mut result);
                     result.push('=');
                     encode_query_component_preserving_pct_into(injected, &mut result);
                     result.push('&');
-                    encode_query_component_preserving_pct_into(&k, &mut result);
+                    encode_decoded_query_component_into(&k, &mut result);
                     result.push('=');
                     encode_query_component_preserving_pct_into(injected, &mut result);
                 }
@@ -458,9 +486,9 @@ pub(crate) fn build_hpp_url(
                 result.push('&');
             }
             first = false;
-            encode_query_component_preserving_pct_into(&k, &mut result);
+            encode_decoded_query_component_into(&k, &mut result);
             result.push('=');
-            encode_query_component_preserving_pct_into(&v, &mut result);
+            encode_decoded_query_component_into(&v, &mut result);
         }
     }
 
@@ -471,11 +499,11 @@ pub(crate) fn build_hpp_url(
                 if !first {
                     result.push('&');
                 }
-                encode_query_component_preserving_pct_into(&param.name, &mut result);
+                encode_decoded_query_component_into(&param.name, &mut result);
                 result.push('=');
-                encode_query_component_preserving_pct_into(safe_value, &mut result);
+                encode_decoded_query_component_into(safe_value, &mut result);
                 result.push('&');
-                encode_query_component_preserving_pct_into(&param.name, &mut result);
+                encode_decoded_query_component_into(&param.name, &mut result);
                 result.push('=');
                 encode_query_component_preserving_pct_into(injected, &mut result);
             }
@@ -483,23 +511,23 @@ pub(crate) fn build_hpp_url(
                 if !first {
                     result.push('&');
                 }
-                encode_query_component_preserving_pct_into(&param.name, &mut result);
+                encode_decoded_query_component_into(&param.name, &mut result);
                 result.push('=');
                 encode_query_component_preserving_pct_into(injected, &mut result);
                 result.push('&');
-                encode_query_component_preserving_pct_into(&param.name, &mut result);
+                encode_decoded_query_component_into(&param.name, &mut result);
                 result.push('=');
-                encode_query_component_preserving_pct_into(safe_value, &mut result);
+                encode_decoded_query_component_into(safe_value, &mut result);
             }
             HppPosition::Both => {
                 if !first {
                     result.push('&');
                 }
-                encode_query_component_preserving_pct_into(&param.name, &mut result);
+                encode_decoded_query_component_into(&param.name, &mut result);
                 result.push('=');
                 encode_query_component_preserving_pct_into(injected, &mut result);
                 result.push('&');
-                encode_query_component_preserving_pct_into(&param.name, &mut result);
+                encode_decoded_query_component_into(&param.name, &mut result);
                 result.push('=');
                 encode_query_component_preserving_pct_into(injected, &mut result);
             }
@@ -529,8 +557,9 @@ pub(crate) fn build_hpp_urls(
 }
 
 /// Build an `application/x-www-form-urlencoded` body that carries `value` for
-/// `name`, replacing the existing value when the param is already present and
-/// appending it otherwise.
+/// `name`, replacing every matching occurrence when the param is already
+/// present and appending it otherwise. Updating all duplicates ensures both
+/// first-value and last-value servers receive the payload.
 ///
 /// This is the single source of truth for form-body injection. It was
 /// previously copy-pasted (byte-identical) across the reflection check, light
@@ -546,7 +575,9 @@ pub(crate) fn build_hpp_urls(
 /// user.
 pub(crate) fn param_is_cookie(target: &Target, param: &Param) -> bool {
     matches!(param.location, Location::Header)
-        && target.cookies.iter().any(|(name, _)| name == &param.name)
+        && param
+            .is_cookie
+            .unwrap_or_else(|| target.cookies.iter().any(|(name, _)| name == &param.name))
 }
 
 /// Build a request injecting `value` into a [`Location::Header`] parameter,
@@ -606,7 +637,6 @@ pub(crate) fn urlencoded_body(data: Option<&str>, name: &str, value: &str) -> St
                 if pair.0 == name {
                     pair.1 = value.to_string();
                     found = true;
-                    break;
                 }
             }
             if !found {
@@ -743,11 +773,25 @@ pub(crate) fn multipart_poc_body(data: Option<&str>, name: &str, value: &str) ->
 /// `<form action=...>` endpoint when the param came from a form, else the
 /// target's own URL. A form-discovered body param reflects at the action
 /// endpoint, not at the page that contained the form.
+///
+/// Belt and braces on the destination: `check_form_discovery` already refuses
+/// to record an action the scan may not send credentials to (anything but the
+/// target's own origin, or a same-host TLS upgrade of it -- see
+/// [`crate::utils::http::same_origin_or_tls_upgrade`]), so this should never
+/// fire. It stays because every site that turns a stored action string back
+/// into an outbound request sends the operator's credentials with it, and a
+/// future producer of `form_action_url` must not be able to reintroduce the leak
+/// by skipping the discovery-time gate. The three such sites are this one,
+/// [`effective_query_base`] (the Query/GET-form path) and
+/// `check_reflection::resolve_sxss_check_urls`; all three repeat the check.
+/// Falling back to the target's own URL keeps the injection on a permitted
+/// destination rather than dropping the param.
 pub(crate) fn resolve_form_action_url(param: &Param, target: &Target) -> url::Url {
     param
         .form_action_url
         .as_ref()
         .and_then(|u| url::Url::parse(u).ok())
+        .filter(|u| crate::utils::http::same_origin_or_tls_upgrade(&target.url, u))
         .unwrap_or_else(|| target.url.clone())
 }
 

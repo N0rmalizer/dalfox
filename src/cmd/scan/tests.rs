@@ -11,13 +11,16 @@ use super::{
     CLI_MAX_TIMEOUT_SECS, CLI_MAX_WORKERS, DEFAULT_DELAY_MS, ScanArgs, ScanOutcome, ScanState,
     finalize_scan_args,
 };
+use crate::REQUEST_COUNTER_TEST_LOCK as RUN_SCAN_LOCK;
 use crate::parameter_analysis::{InjectionContext, Location, Param};
 use crate::scanning::result::{FindingType, Result as ScanResult};
 use crate::target_parser::{Target, parse_target};
 use crate::waf::bypass::{MutationStats, MutationType};
 use axum::Router;
-use axum::http::{HeaderMap, HeaderName, HeaderValue};
-use axum::routing::get;
+use axum::body::Body;
+use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
+use axum::response::Response;
+use axum::routing::{any, get};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
@@ -389,7 +392,7 @@ fn test_generate_poc_curl() {
         .message_str("msg")
         .build();
     let out = generate_poc(&r, "curl");
-    assert!(out.starts_with("curl -X GET "));
+    assert!(out.starts_with("curl -X 'GET' "));
     assert!(out.contains("?q=%3Cx%3E"));
 }
 
@@ -462,7 +465,7 @@ fn test_generate_poc_curl_header_uses_dash_h_flag() {
     r.location = "Header".to_string();
     let out = generate_poc(&r, "curl");
     assert!(
-        out.contains("-H \"X-Custom-Header: <svg/onload=alert(1)>\""),
+        out.contains("-H 'X-Custom-Header: <svg/onload=alert(1)>'"),
         "curl POC missing -H: {}",
         out
     );
@@ -490,11 +493,38 @@ fn test_generate_poc_cookie_uses_cookie_tag_and_dash_b() {
         "plain cookie POC missing [cookie] tag: {}",
         plain
     );
+    // A header param *named* `Cookie` is sent as `Cookie: <payload>`, so the
+    // POC sets that header; `-b 'Cookie=<payload>'` would send a cookie named
+    // `Cookie` instead.
     let curl = generate_poc(&r, "curl");
     assert!(
-        curl.contains("-b \"Cookie=<svg/onload=alert(1)>\""),
-        "curl POC missing -b: {}",
+        curl.contains("-H 'Cookie: <svg/onload=alert(1)>'"),
+        "curl POC must set the Cookie header as sent: {}",
         curl
+    );
+}
+
+#[test]
+fn test_generate_poc_cookie_param_is_sent_as_a_cookie() {
+    // A per-cookie param (`Location::Header`, named after the cookie) is
+    // injected as `Cookie: sid=<payload>`. Rendering it as `-H 'sid: …'`
+    // set a header the application never reads.
+    let mut r = reflected_result("http://example.com/", "sid", "<svg/onload=alert(1)>");
+    r.location = "Header".to_string();
+    r.cookie_param = true;
+    assert!(generate_poc(&r, "plain").contains("[cookie]"));
+    let curl = generate_poc(&r, "curl");
+    assert!(
+        curl.contains("-b 'sid=<svg/onload=alert(1)>'"),
+        "curl: {}",
+        curl
+    );
+    assert!(!curl.contains("-H"), "curl: {}", curl);
+    let httpie = generate_poc(&r, "httpie");
+    assert!(
+        httpie.contains("'Cookie:sid=<svg/onload=alert(1)>'"),
+        "httpie: {}",
+        httpie
     );
 }
 
@@ -526,8 +556,8 @@ fn test_generate_poc_body_emits_data_flag() {
     );
     let curl = generate_poc(&r, "curl");
     assert!(
-        curl.contains("--data \"username=<svg/onload=alert(1)>\""),
-        "curl POC missing --data: {}",
+        curl.contains("--data-urlencode 'username=<svg/onload=alert(1)>'"),
+        "curl POC missing --data-urlencode: {}",
         curl
     );
 }
@@ -780,7 +810,7 @@ async fn test_preflight_content_type_reads_http_csp_header() {
     args.skip_waf_probe = true; // avoid extra request in test
     let preflight = match preflight_content_type(&target, &args).await {
         PreflightOutcome::WithContentType(r) => r,
-        PreflightOutcome::NoContentType(_) => panic!("preflight should return a Content-Type"),
+        PreflightOutcome::NoContentType { .. } => panic!("preflight should return a Content-Type"),
         PreflightOutcome::Unreachable(_) => panic!("preflight target should be reachable in tests"),
     };
     handle.abort();
@@ -802,7 +832,7 @@ async fn test_preflight_content_type_extracts_meta_csp_when_header_missing() {
     args.skip_waf_probe = true;
     let preflight = match preflight_content_type(&target, &args).await {
         PreflightOutcome::WithContentType(r) => r,
-        PreflightOutcome::NoContentType(_) => panic!("preflight should return a Content-Type"),
+        PreflightOutcome::NoContentType { .. } => panic!("preflight should return a Content-Type"),
         PreflightOutcome::Unreachable(_) => panic!("preflight target should be reachable in tests"),
     };
     handle.abort();
@@ -816,6 +846,83 @@ async fn test_preflight_content_type_extracts_meta_csp_when_header_missing() {
             .response_body
             .expect("body expected")
             .contains("http-equiv")
+    );
+}
+
+#[tokio::test]
+async fn preflight_keeps_sniffable_body_when_content_type_is_missing() {
+    let _counter_lock = RUN_SCAN_LOCK.lock().await;
+    let body = "<!doctype html><html><body><script>document.body.innerHTML=location.hash</script></body></html>";
+    let app = Router::new().route(
+        "/",
+        any(move || async move { Response::new(Body::from(body)) }),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind test server");
+    let addr = listener.local_addr().expect("local addr");
+    let handle = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    let target = parse_target(&format!("http://{addr}/")).expect("valid target");
+    let mut args = default_scan_args();
+    args.skip_waf_probe = true;
+
+    let PreflightOutcome::NoContentType {
+        response_body,
+        response_content_type,
+        ..
+    } = preflight_content_type(&target, &args).await
+    else {
+        panic!("the fixture intentionally omits Content-Type");
+    };
+    handle.abort();
+
+    assert_eq!(response_content_type, "");
+    let body = response_body.expect("GET body must be retained without Content-Type");
+    let ast = crate::scanning::ast_integration::run_initial_ast_dom_analysis_for_response(
+        &body,
+        &response_content_type,
+        target.url.as_str(),
+        "GET",
+        crate::scanning::ast_integration::PageSecurityPosture::default(),
+    );
+    assert!(
+        !ast.is_empty(),
+        "sniffable HTML should still reach AST analysis"
+    );
+}
+
+/// A report-only header must not shadow an enforcing `<meta>` policy: the CLI
+/// preflight analyses the policy the browser actually enforces.
+#[tokio::test]
+async fn test_preflight_enforcing_meta_csp_beats_report_only_header() {
+    let html = "<html><head><meta http-equiv=\"Content-Security-Policy\" content=\"script-src 'self'\"></head><body>ok</body></html>";
+    let (url, handle) = spawn_preflight_server(
+        Some((
+            "content-security-policy-report-only",
+            "script-src 'unsafe-inline'",
+        )),
+        html,
+    )
+    .await;
+
+    let target = parse_target(&url).expect("valid target");
+    let mut args = default_scan_args();
+    args.skip_waf_probe = true;
+    let preflight = match preflight_content_type(&target, &args).await {
+        PreflightOutcome::WithContentType(r) => r,
+        PreflightOutcome::NoContentType { .. } => panic!("preflight should return a Content-Type"),
+        PreflightOutcome::Unreachable(_) => panic!("preflight target should be reachable in tests"),
+    };
+    handle.abort();
+
+    assert_eq!(
+        preflight.csp_header,
+        Some((
+            "Content-Security-Policy".to_string(),
+            "script-src 'self'".to_string()
+        ))
     );
 }
 
@@ -877,8 +984,10 @@ fn make_scan_state(results: Vec<ScanResult>) -> ScanState {
         spinner_allowed: false,
         no_color: true,
         dedup: Default::default(),
+        unparsable_lines: 0,
         state_file: None,
         resumed_skipped: 0,
+        streamed_findings: Arc::new(Mutex::new(std::collections::HashSet::new())),
     }
 }
 
@@ -897,7 +1006,7 @@ fn temp_out_path(tag: &str) -> String {
 fn test_generate_poc_httpie_query() {
     let r = reflected_result("https://example.com", "q", "<x>");
     let out = generate_poc(&r, "httpie");
-    assert!(out.starts_with("http get "), "got: {}", out);
+    assert!(out.starts_with("http 'get' "), "got: {}", out);
     assert!(out.contains("?q=%3Cx%3E"), "got: {}", out);
 }
 
@@ -911,7 +1020,7 @@ fn test_generate_poc_httpie_header_uses_header_arg() {
     r.location = "Header".to_string();
     let out = generate_poc(&r, "httpie");
     assert!(
-        out.contains("\"X-Custom-Header:<svg/onload=alert(1)>\""),
+        out.contains("'X-Custom-Header:<svg/onload=alert(1)>'"),
         "httpie header POC missing header arg: {}",
         out
     );
@@ -924,8 +1033,8 @@ fn test_generate_poc_httpie_cookie_uses_cookie_arg() {
     r.location = "Header".to_string();
     let out = generate_poc(&r, "httpie");
     assert!(
-        out.contains("\"Cookie:Cookie=<svg/onload=alert(1)>\""),
-        "httpie cookie POC missing cookie arg: {}",
+        out.contains("'Cookie:<svg/onload=alert(1)>'"),
+        "httpie must set the Cookie header as sent: {}",
         out
     );
 }
@@ -940,9 +1049,9 @@ fn test_generate_poc_httpie_body_uses_form_flag() {
     r.method = "POST".to_string();
     r.location = "Body".to_string();
     let out = generate_poc(&r, "httpie");
-    assert!(out.starts_with("http -f post "), "got: {}", out);
+    assert!(out.starts_with("http -f 'post' "), "got: {}", out);
     assert!(
-        out.contains("\"username=<svg/onload=alert(1)>\""),
+        out.contains("'username=<svg/onload=alert(1)>'"),
         "httpie body POC missing form field: {}",
         out
     );
@@ -954,8 +1063,8 @@ fn test_generate_poc_httpie_jsonbody() {
     r.method = "POST".to_string();
     r.location = "JsonBody".to_string();
     let out = generate_poc(&r, "httpie");
-    assert!(out.starts_with("http post "), "got: {}", out);
-    assert!(out.contains("\"field=<x>\""), "got: {}", out);
+    assert!(out.starts_with("http 'post' "), "got: {}", out);
+    assert!(out.contains("'field=<x>'"), "got: {}", out);
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -969,12 +1078,12 @@ fn test_generate_poc_curl_jsonbody_emits_json_content_type() {
     r.location = "JsonBody".to_string();
     let out = generate_poc(&r, "curl");
     assert!(
-        out.contains("-H \"Content-Type: application/json\""),
+        out.contains("-H 'Content-Type: application/json'"),
         "curl json POC missing content-type: {}",
         out
     );
     assert!(
-        out.contains("--data \"{\\\"field\\\":\\\"<x>\\\"}\""),
+        out.contains("--data '{\"field\":\"<x>\"}'"),
         "curl json POC missing json body: {}",
         out
     );
@@ -990,7 +1099,7 @@ fn test_generate_poc_curl_multipart_uses_form_string() {
     // `--form-string` sends a literal multipart field; `-F` would read the
     // leading `<` as a filename and `--data` would send the wrong wire format.
     assert!(
-        out.contains("--form-string \"file=<x>\""),
+        out.contains("--form-string 'file=<x>'"),
         "curl multipart POC should use --form-string: {}",
         out
     );
@@ -1002,15 +1111,15 @@ fn test_generate_poc_curl_multipart_uses_form_string() {
 }
 
 #[test]
-fn test_generate_poc_curl_escapes_quotes_and_backslashes() {
-    // The curl renderer escapes `"` and `\` in the payload so the shell
-    // command stays well-formed.
+fn test_generate_poc_curl_single_quotes_quotes_and_backslashes() {
+    // Under single quoting `"` and `\` are already literal — they need no
+    // escape and must survive verbatim, or the POC stops reproducing.
     let mut r = reflected_result("http://example.com/", "X-H", "a\"b\\c");
     r.location = "Header".to_string();
     let out = generate_poc(&r, "curl");
     assert!(
-        out.contains("-H \"X-H: a\\\"b\\\\c\""),
-        "curl POC did not escape quotes/backslashes: {}",
+        out.contains("-H 'X-H: a\"b\\c'"),
+        "curl POC mangled quotes/backslashes: {}",
         out
     );
 }
@@ -1154,7 +1263,7 @@ fn test_render_finding_block_curl_poc_type_has_no_ansi_on_poc_line() {
     let block = render_finding_block(&r, "curl", false, false);
     let first_line = block.lines().next().unwrap_or("");
     assert!(
-        first_line.starts_with("curl -X GET "),
+        first_line.starts_with("curl -X 'GET' "),
         "got: {}",
         first_line
     );
@@ -1352,6 +1461,113 @@ async fn test_a_run_that_lost_most_of_its_requests_is_not_a_clean_bill_of_health
         "a run that lost 148 of 170 requests must not report a trustworthy clean, got {}",
         v["meta"]
     );
+}
+
+#[tokio::test]
+async fn a_transport_incomplete_empty_scan_does_not_exit_clean() {
+    let mut args = default_scan_args();
+    args.silence = true;
+    let urls = vec!["https://example.com".to_string()];
+    let requests = crate::cmd::scan::output::RequestTally {
+        sent: 170,
+        failed: 148,
+    };
+    let path = temp_out_path("incomplete_exit_code");
+    args.output = Some(path.clone());
+    let state = make_scan_state(vec![]);
+    let (results, output_write_failed) = render_results(
+        &args,
+        &state,
+        &urls,
+        std::time::Duration::from_millis(7),
+        requests,
+        false,
+        None,
+    )
+    .await;
+    let report: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).expect("report written"))
+            .expect("valid JSON");
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(report["meta"]["incomplete"], true);
+
+    let outcome = super::output::derive_outcome(
+        &args,
+        &urls,
+        &state,
+        &results,
+        requests,
+        output_write_failed,
+    )
+    .await;
+    assert_eq!(
+        outcome,
+        ScanOutcome::Error,
+        "an empty report marked incomplete because most requests failed must not exit with the clean code"
+    );
+}
+
+#[tokio::test]
+async fn a_later_scan_does_not_inherit_request_failures_from_an_earlier_run() {
+    use std::sync::atomic::Ordering;
+    let _serial = RUN_SCAN_LOCK.lock().await;
+
+    // A stale tally left by an earlier run, far above anything a real scan
+    // (or a foreign lib test ticking the global concurrently) could add. The
+    // assertion is only that it did not survive into this run's report, so
+    // unrelated failures elsewhere in the binary cannot flip it.
+    const STALE_FAILURES: u64 = 1 << 40;
+    crate::REQUEST_FAILURE_COUNT.store(STALE_FAILURES, Ordering::Relaxed);
+    let app = Router::new().route(
+        "/",
+        get(|| async {
+            (
+                [("content-type", "text/html; charset=utf-8")],
+                "<html><body>healthy</body></html>",
+            )
+        }),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let server = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    let path = temp_out_path("stale_request_failures");
+    let args = ScanArgs {
+        input_type: "url".to_string(),
+        targets: vec![format!("http://{addr}/?q=1")],
+        format: "json".to_string(),
+        output: Some(path.clone()),
+        silence: true,
+        skip_xss_scanning: true,
+        skip_discovery: true,
+        skip_mining: true,
+        skip_mining_dict: true,
+        skip_mining_dom: true,
+        skip_waf_probe: true,
+        skip_ast_analysis: true,
+        insecure: Some(true),
+        ..ScanArgs::default()
+    };
+
+    let outcome = super::run_scan(&args).await;
+    let report: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).expect("report written"))
+            .expect("valid JSON");
+    server.abort();
+    let _ = std::fs::remove_file(&path);
+
+    let failed = report["meta"]["failed_requests"]
+        .as_u64()
+        .expect("failed_requests");
+    assert!(
+        failed < STALE_FAILURES,
+        "a scan must report only failures from this run, got {failed}"
+    );
+    // The exit code is deliberately not asserted: other lib tests tick the
+    // global counters while this scan runs, which could legitimately push a
+    // two-request scan over the incomplete threshold.
+    let _ = outcome;
 }
 
 #[tokio::test]
@@ -2778,4 +2994,527 @@ fn test_finalize_scan_args_folds_globals_and_expands_include_all() {
         out.include_request && out.include_response,
         "--include-all expands to request+response"
     );
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// output.rs — report file permissions
+// ─────────────────────────────────────────────────────────────────────────
+
+#[cfg(unix)]
+#[test]
+fn test_output_report_file_is_created_private() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let path = std::env::temp_dir().join(format!(
+        "dalfox-report-perm-{}-{}.json",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let path_str = path.to_string_lossy().to_string();
+    let _ = std::fs::remove_file(&path);
+
+    let target = target_with_params(
+        "https://example.com",
+        vec![make_param("q", Location::Query)],
+    );
+    let mut args = default_scan_args();
+    args.format = "json".to_string();
+    args.silence = true;
+    args.output = Some(path_str.clone());
+    let outcome = render_only_discovery(
+        &args,
+        &host_group(vec![target.clone()]),
+        &make_scan_state(vec![]),
+    );
+    assert!(matches!(outcome, ScanOutcome::Clean));
+
+    // A report carries the raw request under --include-request, headers and
+    // cookie jar included; it must not be world-readable.
+    let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600, "report file mode was {:o}", mode);
+
+    // Re-running still overwrites in place rather than appending.
+    let first_len = std::fs::metadata(&path).unwrap().len();
+    let outcome = render_only_discovery(&args, &host_group(vec![target]), &make_scan_state(vec![]));
+    assert!(matches!(outcome, ScanOutcome::Clean));
+    assert_eq!(std::fs::metadata(&path).unwrap().len(), first_len);
+
+    let _ = std::fs::remove_file(&path);
+}
+
+/// A scan worker that panicked is swallowed by `run_scanning`'s join loop and
+/// only surfaces as `ScanRunReport::worker_panics`. The CLI ignored it: the
+/// target read `clean`, the run exited 0, and `--state-file` recorded it
+/// `completed`, so every resume skipped a parameter that was never tested.
+#[tokio::test]
+async fn a_worker_panic_fails_the_target_instead_of_reading_clean() {
+    let _serial = RUN_SCAN_LOCK.lock().await;
+    let app = Router::new().route(
+        "/",
+        get(
+            |axum::extract::Query(q): axum::extract::Query<HashMap<String, String>>| async move {
+                let echo: String = q.values().cloned().collect();
+                (
+                    [("content-type", "text/html")],
+                    format!("<html><body>{echo}</body></html>"),
+                )
+            },
+        ),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let server = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    let dir = std::env::temp_dir();
+    let tag = format!(
+        "{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let out = dir.join(format!("dalfox-worker-panic-{tag}.json"));
+    let state = dir.join(format!("dalfox-worker-panic-{tag}.jsonl"));
+    let target = format!(
+        "http://{addr}/?{}=1",
+        crate::scanning::TEST_WORKER_PANIC_PARAM
+    );
+    let args = ScanArgs {
+        input_type: "url".to_string(),
+        format: "json".to_string(),
+        output: Some(out.to_string_lossy().to_string()),
+        state_file: Some(state.to_string_lossy().to_string()),
+        silence: true,
+        targets: vec![target],
+        // Query discovery has to run: it is what turns the URL's parameter
+        // into a scan worker.
+        skip_mining: true,
+        skip_reflection_header: true,
+        skip_reflection_cookie: true,
+        skip_reflection_path: true,
+        skip_waf_probe: true,
+        skip_ast_analysis: true,
+        insecure: Some(true),
+        ..ScanArgs::default()
+    };
+    let outcome = super::run_scan(&args).await;
+    server.abort();
+
+    let report: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&out).expect("report written"))
+            .expect("valid JSON");
+    let summary = &report["meta"]["target_summary"][0];
+    let recorded = std::fs::read_to_string(&state).unwrap_or_default();
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&state);
+
+    assert_ne!(summary["status"], "clean", "{summary}");
+    assert_eq!(
+        summary["error_code"],
+        crate::cmd::error_codes::INTERNAL_ERROR,
+        "{summary}"
+    );
+    assert!(
+        !matches!(outcome, ScanOutcome::Clean),
+        "a panicked scan must not exit 0"
+    );
+    assert!(
+        recorded.contains("\"error\"") && !recorded.contains("\"completed\""),
+        "the target must be retried on resume: {recorded}"
+    );
+}
+
+#[tokio::test]
+async fn a_session_marker_beyond_the_preflight_range_does_not_fail_the_scan() {
+    let _serial = RUN_SCAN_LOCK.lock().await;
+    let marker = "signed-in-marker";
+    let full_body = format!(
+        "{}{}",
+        "x".repeat(crate::cmd::scan::preflight::PREFLIGHT_BODY_BYTES),
+        marker
+    );
+    let full_len = full_body.len();
+    let app = Router::new().route(
+        "/",
+        axum::routing::any(move |headers: HeaderMap| {
+            let full_body = full_body.clone();
+            async move {
+                if headers.contains_key(axum::http::header::RANGE) {
+                    Response::builder()
+                        .status(StatusCode::PARTIAL_CONTENT)
+                        .header("content-type", "text/html")
+                        .header("content-range", format!("bytes 0-8191/{full_len}"))
+                        .body(Body::from(
+                            full_body[..crate::cmd::scan::preflight::PREFLIGHT_BODY_BYTES]
+                                .to_string(),
+                        ))
+                        .expect("partial response")
+                } else {
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header("content-type", "text/html")
+                        .body(Body::from(full_body))
+                        .expect("full response")
+                }
+            }
+        }),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let server = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    let path = temp_out_path("partial_session_marker");
+    let args = ScanArgs {
+        targets: vec![format!("http://{addr}/?q=1")],
+        session_check: Some(marker.to_string()),
+        skip_xss_scanning: true,
+        skip_discovery: true,
+        skip_mining: true,
+        output: Some(path.clone()),
+        ..default_scan_args()
+    };
+    let outcome = super::run_scan(&args).await;
+    server.abort();
+
+    let report: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).expect("report written"))
+            .expect("valid JSON");
+    let _ = std::fs::remove_file(path);
+    assert_eq!(
+        outcome,
+        ScanOutcome::Clean,
+        "the check marker is present on the full response, outside the preflight Range sample"
+    );
+    assert_eq!(report["meta"]["incomplete"], false);
+    assert_eq!(report["meta"]["target_summary"][0]["status"], "clean");
+}
+
+/// `--dry-run` (and the REST / MCP preflight, which runs as one) promises not
+/// to send attack payloads; the WAF provocation probe carries a `<script>`.
+#[tokio::test]
+async fn finish_waf_detection_sends_no_provocation_probe_on_a_dry_run() {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let counter = hits.clone();
+    let app = Router::new().route(
+        "/",
+        get(move || {
+            let counter = counter.clone();
+            async move {
+                counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                "ok"
+            }
+        }),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let server = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    let target = parse_target(&format!("http://{addr}/")).expect("target");
+    let client = target.build_client_or_default();
+
+    for (dry_run, expected_hits) in [(true, 0), (false, 1)] {
+        hits.store(0, std::sync::atomic::Ordering::Relaxed);
+        let args = ScanArgs {
+            dry_run,
+            ..ScanArgs::default()
+        };
+        super::finish_waf_detection(Default::default(), None, &target, &client, &args).await;
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::Relaxed),
+            expected_hits,
+            "dry_run={dry_run}"
+        );
+    }
+    server.abort();
+}
+
+/// With `--stream-findings`, only what the streaming printer already emitted is
+/// left out of the end-of-scan output. Findings produced outside
+/// `run_scanning` (initial AST pass, outdated libs, OOB callbacks) never reach
+/// the printer and were printed by neither path.
+#[test]
+fn stream_findings_end_of_scan_renders_what_the_printer_never_saw() {
+    let make = |ty: FindingType, param: &str| {
+        ScanResult::builder(ty)
+            .inject_type("inHTML")
+            .method("GET")
+            .data("https://example.com/?q=1")
+            .param(param)
+            .payload("<b>x</b>")
+            .cwe("CWE-79")
+            .severity("High")
+            .message_id(0)
+            .message_str("m")
+            .build()
+    };
+    let streamed = make(FindingType::Verified, "streamedparam");
+    let unstreamed = make(FindingType::AstDetected, "astparam");
+    let mut seen = std::collections::HashSet::new();
+    seen.insert(super::output::stream_key(&streamed));
+    let args = default_scan_args();
+    let results = vec![streamed, unstreamed];
+
+    let out = super::output::render_plain_finding_blocks(&args, &results, Some(&seen));
+    assert!(out.contains("[POC][A]"), "{out}");
+    assert!(!out.contains("[POC][V]"), "{out}");
+
+    // Streaming off: every block is rendered.
+    let out = super::output::render_plain_finding_blocks(&args, &results, None);
+    assert!(
+        out.contains("[POC][A]") && out.contains("[POC][V]"),
+        "{out}"
+    );
+}
+
+/// One page-level DOM sink is re-found by every parameter's AST pass (and by the
+/// initial pass), each copy carrying its own `param`. The final report folds them
+/// into one finding; the streamer must fold them the same way, or it prints one
+/// block per parameter live and the folded survivor once more at the end.
+#[test]
+fn stream_findings_folds_ast_duplicates_like_the_final_report() {
+    let evidence = "http://t/dom:1:16 - DOM-based XSS via location.hash to document.write (Source: location.hash, Sink: document.write)";
+    let make = |ty: FindingType, param: &str, msg: &str| {
+        ScanResult::builder(ty)
+            .inject_type("DOM-XSS")
+            .method("GET")
+            .data("http://t/dom#%3Cimg%3E")
+            .param(param)
+            .payload("#<img>")
+            .evidence(evidence)
+            .cwe("CWE-79")
+            .severity("Medium")
+            .message_id(0)
+            .message_str(msg)
+            .build()
+    };
+    let initial = make(FindingType::AstDetected, "hash", "initial pass");
+    let from_a = make(FindingType::AstDetected, "a", "param a");
+    let from_b = make(FindingType::AstDetected, "b", "param b");
+
+    // The printer inserts each streamed finding's key and skips repeats.
+    let mut seen = std::collections::HashSet::new();
+    assert!(seen.insert(super::output::stream_key(&from_a)));
+    assert!(
+        !seen.insert(super::output::stream_key(&from_b)),
+        "a second parameter's copy of the same AST finding must not print again"
+    );
+
+    let final_results = dedupe_ast_results(vec![initial, from_a, from_b]);
+    assert_eq!(final_results.len(), 1);
+    let args = default_scan_args();
+    let out = super::output::render_plain_finding_blocks(&args, &final_results, Some(&seen));
+    assert!(out.is_empty(), "survivor was already streamed: {out}");
+
+    // A stronger survivor than what was streamed is still shown at the end.
+    let upgraded = make(FindingType::Verified, "a", "verified");
+    let final_results =
+        dedupe_ast_results(vec![make(FindingType::AstDetected, "a", "m"), upgraded]);
+    let out = super::output::render_plain_finding_blocks(&args, &final_results, Some(&seen));
+    assert!(out.contains("[POC][V]"), "{out}");
+}
+
+/// The aggregate exit code must also escalate: a panicked-but-empty target
+/// alongside a healthy sibling used to fall through to Clean (exit 0), because
+/// `all_unreachable` only fires when *every* target is skipped. That is the
+/// "a panic reads as a clean scan" class, for the whole-run code.
+#[tokio::test]
+async fn a_worker_panic_alongside_a_healthy_target_still_fails_the_run() {
+    let _serial = RUN_SCAN_LOCK.lock().await;
+    // `/safe` never reflects, so the healthy target scans clean (0 findings)
+    // and the run's report is empty — the escalation is not masked by a finding
+    // elsewhere (which would correctly exit 1 instead). `/echo` reflects so the
+    // panic param becomes a scannable worker that then panics.
+    let app = Router::new()
+        .route(
+            "/safe",
+            get(|| async { ([("content-type", "text/html")], "<html><body>ok</body></html>") }),
+        )
+        .route(
+            "/echo",
+            get(
+                |axum::extract::Query(q): axum::extract::Query<HashMap<String, String>>| async move {
+                    let echo: String = q.values().cloned().collect();
+                    (
+                        [("content-type", "text/html")],
+                        format!("<html><body>{echo}</body></html>"),
+                    )
+                },
+            ),
+        );
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let server = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    // A healthy target (a param that does not reflect → clean, 0 findings) and
+    // a target whose worker panics.
+    let healthy = format!("http://{addr}/safe?x=1");
+    let panicky = format!(
+        "http://{addr}/echo?{}=1",
+        crate::scanning::TEST_WORKER_PANIC_PARAM
+    );
+    let args = ScanArgs {
+        input_type: "url".to_string(),
+        format: "json".to_string(),
+        silence: true,
+        targets: vec![healthy, panicky],
+        skip_mining: true,
+        skip_reflection_header: true,
+        skip_reflection_cookie: true,
+        skip_reflection_path: true,
+        skip_waf_probe: true,
+        skip_ast_analysis: true,
+        insecure: Some(true),
+        ..ScanArgs::default()
+    };
+    let outcome = super::run_scan(&args).await;
+    server.abort();
+    assert_eq!(
+        outcome,
+        ScanOutcome::Error,
+        "a run with a panicked target must not exit 0 just because a sibling was clean"
+    );
+}
+
+/// End to end: a header and a cookie param behind a size-limited WAF window
+/// are only reachable with the `wafpad` prefix. The scan sends it and finds
+/// the reflection; the `curl` / `httpie` POCs rendered from those findings
+/// must send it too — and the cookie param as a cookie — or pasting them just
+/// hits the WAF (or a header the application never reads).
+#[tokio::test]
+async fn side_channel_pocs_from_a_real_scan_carry_the_wafpad_prefix() {
+    fn window_blocked(v: &str) -> bool {
+        v.chars().take(100).any(|c| c == '<' || c == '>')
+    }
+    let app = Router::new().route(
+        "/",
+        get(|headers: HeaderMap| async move {
+            let hdr = headers
+                .get("x-q")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default()
+                .to_string();
+            let sid = headers
+                .get("cookie")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|c| {
+                    c.split("; ")
+                        .find_map(|kv| kv.strip_prefix("sid=").map(str::to_string))
+                })
+                .unwrap_or_default();
+            if window_blocked(&hdr) || window_blocked(&sid) {
+                return (
+                    axum::http::StatusCode::FORBIDDEN,
+                    axum::response::Html("blocked".to_string()),
+                );
+            }
+            (
+                axum::http::StatusCode::OK,
+                axum::response::Html(format!(
+                    "<html><body><div>{hdr}</div><p>{sid}</p></body></html>"
+                )),
+            )
+        }),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let server = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    let mut target = parse_target(&format!("http://{addr}/")).expect("target");
+    target.cookies = vec![("sid".to_string(), "abc".to_string())];
+    for name in ["X-Q", "sid"] {
+        let mut p = Param::new(name.to_string(), String::new(), Location::Header);
+        p.injection_context = Some(InjectionContext::Html(None));
+        p.pre_encoding = Some("wafpad".to_string());
+        target.reflection_params.push(p);
+    }
+    let args = Arc::new(ScanArgs {
+        skip_mining: true,
+        skip_discovery: true,
+        skip_ast_analysis: true,
+        skip_waf_probe: true,
+        waf_bypass: "off".to_string(),
+        encoders: vec!["none".to_string()],
+        timeout: 5,
+        workers: 4,
+        ..default_scan_args()
+    });
+    let results = Arc::new(Mutex::new(Vec::new()));
+    crate::scanning::run_scanning(
+        &target,
+        args,
+        crate::scanning::ScanRunHandles::new(results.clone(), Arc::new(AtomicUsize::new(0))),
+    )
+    .await;
+    server.abort();
+
+    let pad = crate::encoding::pre_encoding::waf_window_pad();
+    let results = results.lock().await;
+    for name in ["X-Q", "sid"] {
+        let r = results
+            .iter()
+            .find(|r| r.param == name)
+            .unwrap_or_else(|| panic!("no finding for {name}: {} results", results.len()));
+        let wire = format!("{pad}{}", r.payload);
+        let curl = generate_poc(r, "curl");
+        let httpie = generate_poc(r, "httpie");
+        let (curl_arg, httpie_arg) = if name == "sid" {
+            (format!("-b 'sid={wire}'"), format!("'Cookie:sid={wire}'"))
+        } else {
+            (format!("-H 'X-Q: {wire}'"), format!("'X-Q:{wire}'"))
+        };
+        assert!(curl.contains(&curl_arg), "{name} curl: {curl}");
+        assert!(httpie.contains(&httpie_arg), "{name} httpie: {httpie}");
+    }
+}
+
+/// An origin that answers *every* request with the same blocking status (an
+/// auth wall's 403, a maintenance page's 503) is not a WAF: the provocation
+/// probe getting that status too says nothing about the payload. Reading it as
+/// `Unknown(HTTP 503)` engaged a bypass strategy — mutations, extra encoders
+/// and a 1.5 s per-request delay hint — against a WAF-less target.
+#[tokio::test]
+async fn preflight_does_not_infer_a_waf_from_a_status_the_page_always_returns() {
+    for status in [403u16, 503] {
+        let app = Router::new().route(
+            "/",
+            get(move || async move {
+                (
+                    axum::http::StatusCode::from_u16(status).unwrap(),
+                    [("content-type", "text/html")],
+                    "<html><body>unavailable</body></html>",
+                )
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let target = parse_target(&format!("http://{addr}/")).expect("target");
+        let args = default_scan_args();
+        let preflight = match preflight_content_type(&target, &args).await {
+            PreflightOutcome::WithContentType(r) => r,
+            _ => panic!("preflight should return a Content-Type"),
+        };
+        server.abort();
+        assert!(
+            preflight.waf_result.is_empty(),
+            "HTTP {status} on every request is not a WAF: {:?}",
+            preflight.waf_result.detected
+        );
+    }
 }

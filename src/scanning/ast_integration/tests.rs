@@ -52,6 +52,126 @@ fn executable_script_types_reach_the_result_pipeline() {
 }
 
 #[test]
+fn initial_ast_uses_the_response_parser_and_suppresses_inert_types() {
+    let html = r#"<!doctype html><html><body><script>document.body.innerHTML=location.hash</script></body></html>"#;
+    let posture = PageSecurityPosture::default();
+    for content_type in [
+        "application/json",
+        "text/json; charset=utf-8",
+        "text/plain",
+        "text/plain; charset=utf-8",
+        "text/csv",
+        "application/javascript",
+    ] {
+        let results = run_initial_ast_dom_analysis_for_response(
+            html,
+            content_type,
+            "https://example.com/",
+            "GET",
+            posture,
+        );
+        assert!(results.is_empty(), "{content_type}: {results:?}");
+    }
+
+    for content_type in ["text/html", ""] {
+        let results = run_initial_ast_dom_analysis_for_response(
+            html,
+            content_type,
+            "https://example.com/",
+            "GET",
+            posture,
+        );
+        assert!(
+            !results.is_empty(),
+            "{content_type}: expected HTML AST findings"
+        );
+    }
+
+    let xhtml = r#"<html xmlns="http://www.w3.org/1999/xhtml"><body><script>document.body.innerHTML=location.hash</script></body></html>"#;
+    let results = run_initial_ast_dom_analysis_for_response(
+        xhtml,
+        "application/xhtml+xml; charset=utf-8",
+        "https://example.com/",
+        "GET",
+        posture,
+    );
+    assert!(
+        !results.is_empty(),
+        "valid XHTML script must reach XML AST analysis"
+    );
+
+    let generic_xml = r#"<root><script>document.body.innerHTML=location.hash</script></root>"#;
+    let results = run_initial_ast_dom_analysis_for_response(
+        generic_xml,
+        "application/xml",
+        "https://example.com/",
+        "GET",
+        posture,
+    );
+    assert!(
+        results.is_empty(),
+        "unnamespaced XML is not an active markup document"
+    );
+}
+
+#[test]
+fn xml_ast_extraction_preserves_xml_names_and_active_namespaces() {
+    let xml = r#"<html xmlns="http://www.w3.org/1999/xhtml"><body onload="run(location.hash)"><script id="app">document.body.innerHTML=location.hash</script><SCRIPT id="uppercase">document.write(location.hash)</SCRIPT><script type="application/json">document.write(location.hash)</script></body></html>"#;
+    let (blocks, ids) = extract_js_and_script_ids_from_xml(xml);
+    assert!(ids.contains("app"));
+    assert!(!ids.contains("uppercase"));
+    assert_eq!(blocks.len(), 2);
+    assert!(blocks.iter().any(|block| block.contains("innerHTML")));
+    assert!(
+        blocks
+            .iter()
+            .any(|block| block.contains("run(location.hash)"))
+    );
+    assert!(!blocks.iter().any(|block| block.contains("document.write")));
+}
+
+#[test]
+fn xml_ast_analysis_recovers_active_scripts_before_ten_thousand_deep_tail() {
+    let deep_open = "<n>".repeat(10_000);
+    let deep_close = "</n>".repeat(10_000);
+    let code = "document.body.innerHTML=location.hash;";
+    let xhtml_ns = "http://www.w3.org/1999/xhtml";
+    let svg_ns = "http://www.w3.org/2000/svg";
+    let fixtures = [
+        (
+            "application/xml",
+            format!(
+                "<root><script xmlns=\"{xhtml_ns}\">{code}</script>{deep_open}{deep_close}</root>"
+            ),
+        ),
+        (
+            "application/xhtml+xml",
+            format!(
+                "<html xmlns=\"{xhtml_ns}\"><body><script>{code}</script>{deep_open}{deep_close}</body></html>"
+            ),
+        ),
+        (
+            "image/svg+xml",
+            format!("<svg xmlns=\"{svg_ns}\"><script>{code}</script>{deep_open}{deep_close}</svg>"),
+        ),
+    ];
+
+    for (content_type, body) in fixtures {
+        let results = run_initial_ast_dom_analysis_for_response(
+            &body,
+            content_type,
+            "https://example.com/",
+            "GET",
+            PageSecurityPosture::default(),
+        );
+        assert!(
+            !results.is_empty(),
+            "{content_type} should recover the executable script before deeply nested markup"
+        );
+    }
+}
+
+#[test]
 fn external_script_discovery_skips_data_blocks() {
     let html = r#"
         <script type="application/json" src="/data.json"></script>
@@ -1442,7 +1562,8 @@ fn test_posture_from_response_meta_report_only_enforces_nothing() {
     assert!(p.inline_script_allowed);
 }
 
-/// Header wins over the document, and the enforcing header wins over
+/// A header and a meta policy are both enforced, so the restrictive header is
+/// not relaxed by a permissive meta; the enforcing header wins over
 /// report-only — the same precedence preflight applies.
 #[test]
 fn test_posture_from_response_header_precedence() {
@@ -1468,6 +1589,67 @@ fn test_posture_from_response_header_precedence() {
         !p.inline_script_allowed,
         "enforcing header must win over report-only"
     );
+}
+
+/// A report-only header enforces nothing, so it must not shadow an enforcing
+/// `<meta>` policy in the same response. The report-only header used to win
+/// simply for being a header, and the enforcing meta was never read.
+#[test]
+fn test_posture_from_response_enforcing_meta_beats_report_only_header() {
+    let body = r#"<html><head>
+        <meta http-equiv="Content-Security-Policy"
+              content="script-src 'self'; require-trusted-types-for 'script'">
+        </head><body></body></html>"#;
+    let p = PageSecurityPosture::from_response(
+        &headers_with(&[(
+            "content-security-policy-report-only",
+            "script-src 'unsafe-inline'",
+        )]),
+        body,
+    );
+    assert!(
+        !p.inline_script_allowed,
+        "the enforcing meta policy restricts inline script"
+    );
+    assert!(p.trusted_types_enforced, "the enforcing meta requires TT");
+}
+
+/// Browsers enforce every `Content-Security-Policy` header, so a restriction
+/// sent in a second header line applies. Only the first line used to be read,
+/// grading a Trusted-Types-hardened, nonce-only page `high`.
+#[test]
+fn test_posture_from_response_reads_every_enforcing_header() {
+    let mut h = headers_with(&[("content-security-policy", "object-src 'none'")]);
+    h.append(
+        reqwest::header::CONTENT_SECURITY_POLICY,
+        reqwest::header::HeaderValue::from_static(
+            "script-src 'nonce-abc'; require-trusted-types-for 'script'",
+        ),
+    );
+    let p = PageSecurityPosture::from_response(&h, "");
+    assert!(
+        !p.inline_script_allowed,
+        "second header's script-src applies"
+    );
+    assert!(
+        p.trusted_types_enforced,
+        "second header's TT requirement applies"
+    );
+}
+
+/// An enforcing header does not hide an enforcing `<meta>` policy: both apply.
+#[test]
+fn test_posture_from_response_combines_header_and_meta() {
+    let body = r#"<meta http-equiv="Content-Security-Policy" content="require-trusted-types-for 'script'">"#;
+    let p = PageSecurityPosture::from_response(
+        &headers_with(&[("content-security-policy", "script-src 'unsafe-inline'")]),
+        body,
+    );
+    assert!(
+        p.inline_script_allowed,
+        "neither policy restricts inline script"
+    );
+    assert!(p.trusted_types_enforced, "the meta policy requires TT");
 }
 
 #[test]
@@ -1513,4 +1695,102 @@ fn test_grade_ast_finding_origin_fixed_sources_grade_low() {
             reason
         );
     }
+}
+
+#[test]
+fn reflected_markup_prescan_finds_marker_slots_only() {
+    let m = crate::scanning::markers::open_marker();
+    let html = format!(
+        r#"<html><head><style>body {{ --theme: {m}; --plain: red; }}</style></head><body>
+        <div id="target" data-content="{m}" data-other="x"></div>
+        <noscript id="ns">{m}</noscript>
+        <div data-noid="{m}"></div>
+        <div id="clean" data-content="hello">plain</div>
+        <span id="styled" style="--inline: {m}"></span>
+        <script>1</script></body></html>"#
+    );
+    let (_, _, markup) = extract_js_script_ids_and_reflected_markup(&html);
+    assert_eq!(
+        markup
+            .attrs
+            .get("target")
+            .map(|a| a.contains("data-content")),
+        Some(true)
+    );
+    assert!(!markup.attrs["target"].contains("data-other"));
+    assert!(!markup.attrs.contains_key("clean"));
+    assert!(markup.text.contains("ns"));
+    assert!(!markup.text.contains("clean"));
+    assert!(markup.css_custom_properties.contains("--theme"));
+    assert!(markup.css_custom_properties.contains("--inline"));
+    assert!(!markup.css_custom_properties.contains("--plain"));
+
+    // A response without this scan's marker proves nothing.
+    let (_, _, empty) = extract_js_script_ids_and_reflected_markup(
+        r#"<div id="t" data-content="dlxdeadbeef">x</div>"#,
+    );
+    assert!(empty.is_empty());
+}
+
+/// End to end through the per-param entry point's analysis: a page that reads
+/// back a reflected `data-*` attribute yields a markup-sourced finding graded
+/// as reachable, and the same page without the marker yields nothing.
+#[test]
+fn reflected_markup_flow_is_found_and_graded_reachable() {
+    let m = crate::scanning::markers::open_marker();
+    let page = |value: &str| {
+        format!(
+            r#"<div id="target" data-content="{value}"></div><script>
+            document.getElementById('target').innerHTML = document.getElementById('target').dataset.content;
+            </script>"#
+        )
+    };
+    let run = |html: &str| {
+        let (js, ids, markup) = extract_js_script_ids_and_reflected_markup(html);
+        js.iter()
+            .flat_map(|code| {
+                analyze_javascript_for_dom_xss_with_html_context(
+                    code,
+                    "http://t/",
+                    &ids,
+                    &markup,
+                    false,
+                )
+            })
+            .map(|(v, _, _)| v)
+            .collect::<Vec<_>>()
+    };
+    let found = run(&page(m));
+    let v = found
+        .first()
+        .expect("reflected data-* read reaches innerHTML");
+    assert_eq!(v.source, "markup:#target[data-content]");
+    let (grade, reason) = grade_ast_finding(
+        &v.source,
+        &v.sink,
+        false,
+        false,
+        PageSecurityPosture::default(),
+    );
+    assert_eq!(grade, crate::scanning::result::Confidence::High, "{reason}");
+    assert!(run(&page("static")).is_empty());
+}
+
+/// Form ids are collected on every page (no marker needed), and a
+/// `form.action` finding gets a `javascript:` payload, the only scheme a form
+/// submission navigates to and runs.
+#[test]
+fn form_ids_prescan_and_form_action_payload() {
+    let (_, _, markup) = extract_js_script_ids_and_reflected_markup(
+        r#"<form id="f"></form><form></form><div id="d"></div><script>1</script>"#,
+    );
+    assert!(markup.form_ids.contains("f"));
+    assert!(!markup.form_ids.contains("d"));
+    assert!(markup.is_empty(), "form ids are not reflected slots");
+
+    let (payload, _) = generate_dom_xss_poc("URLSearchParams.get(query)", "form.action");
+    assert!(
+        payload.starts_with("query=javascript:alert(1)"),
+        "{payload}"
+    );
 }

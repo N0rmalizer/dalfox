@@ -70,6 +70,9 @@ impl<'a> DomXssVisitor<'a> {
         if let Some(func_name) = self.get_expr_string(&call.callee)
             && (self.sanitizers.contains(func_name.as_str())
                 || Self::is_likely_sanitizer_name(&func_name))
+            && !(NUMERIC_COERCIONS.contains(&func_name.as_str())
+                && (self.function_summaries.contains_key(&func_name)
+                    || self.overridden_coercions.contains(&func_name)))
         {
             return (false, None);
         }
@@ -254,6 +257,13 @@ impl<'a> DomXssVisitor<'a> {
         // `getComputedStyle(el).getPropertyValue('--x')` reads back a custom
         // property this script wrote a tainted value into.
         if let Some(source) = self.css_custom_property_read_source(call) {
+            return (true, Some(source));
+        }
+        // …or reads back markup the server filled from the parameter.
+        if let Some(source) = self.reflected_markup_source_for_call(call) {
+            return (true, Some(source));
+        }
+        if let Some(source) = self.decoded_reflected_literal_source(call) {
             return (true, Some(source));
         }
 
@@ -600,6 +610,9 @@ impl<'a> DomXssVisitor<'a> {
             return true;
         }
         if self.file_reader_source_for_member(member).is_some() {
+            return true;
+        }
+        if self.reflected_markup_source_for_member(member).is_some() {
             return true;
         }
         if let Some(full_path) = self.get_member_string(member) {

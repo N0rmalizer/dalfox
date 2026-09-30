@@ -17,7 +17,7 @@ use std::fmt;
 /// Internal code uses descriptive variant names; serialization produces the
 /// single-letter abbreviation for compact user-facing output and backward-
 /// compatible JSON (`"V"`, `"A"`, `"R"`).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub enum FindingType {
     /// Vulnerable — dalfox asserts the input is exploitable.
     #[serde(rename = "V")]
@@ -105,7 +105,7 @@ impl fmt::Display for FindingType {
 /// the HTTP method. This is the stable selector for "AST-detected findings":
 /// prefer it over `type == "A"`, which is being absorbed into the confidence
 /// axis (issue #1238).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub enum FindingMethod {
     /// Payload injected and its bytes located in the response.
     #[serde(rename = "reflection")]
@@ -172,7 +172,7 @@ impl fmt::Display for FindingMethod {
 /// Two levels on purpose: the tier migration derives `type` from this
 /// directly (`high` → `V`, `low` → `R`), so a third level would only defer the
 /// same decision. Ambiguous cases grade `Low` — the conservative direction.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub enum Confidence {
     #[serde(rename = "high")]
     High,
@@ -253,6 +253,24 @@ pub struct Result {
     /// rendering hint — never serialized.
     #[serde(skip)]
     pub poc_url_complete: bool,
+    /// The injected value exactly as it went on the wire, when that differs
+    /// from `payload` — i.e. after the param's pre-encoding (base64 / multi-URL
+    /// / WAF window-pad / nested pipeline) was applied. `payload` stays the raw
+    /// vector the reflection is matched against; the `curl` / `httpie` POCs
+    /// for side-channel locations (header, cookie, body) must send this value
+    /// instead, or a pasted POC omits the encoding the finding depended on.
+    /// `None` when no pre-encoding applied. Internal rendering hint — never
+    /// serialized.
+    #[serde(skip)]
+    pub wire_payload: Option<String>,
+    /// True when this `Header`-located param is one of the target's cookies,
+    /// which the scan injects into the `Cookie` header as `name=value`
+    /// (`url_inject::param_is_cookie`) rather than as a header of its own
+    /// name. The `curl` / `httpie` POCs need it to emit a cookie instead of a
+    /// `name: value` header the application never reads. Internal rendering
+    /// hint — never serialized.
+    #[serde(skip)]
+    pub cookie_param: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub request: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -306,6 +324,17 @@ pub(crate) fn bound_evidence_body(body: String, payload: &str) -> String {
 }
 
 impl Result {
+    /// Record where `param` travels on the wire: the `location` label and,
+    /// for a header-located cookie param, the `cookie_param` POC hint.
+    pub(crate) fn set_injection_point(
+        &mut self,
+        target: &crate::target_parser::Target,
+        param: &crate::parameter_analysis::Param,
+    ) {
+        self.location = format!("{:?}", param.location);
+        self.cookie_param = crate::scanning::url_inject::param_is_cookie(target, param);
+    }
+
     /// Start building a finding. `result_type` is the only required field;
     /// every other field starts empty (`""` / `0` / `None`) and is filled in
     /// with the chained setters on [`ResultBuilder`], finishing with
@@ -339,6 +368,8 @@ impl Result {
                 location: String::new(),
                 new_since_baseline: None,
                 poc_url_complete: false,
+                wire_payload: None,
+                cookie_param: false,
                 request: None,
                 response: None,
             },
@@ -435,7 +466,7 @@ impl ResultBuilder {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub(crate) struct SanitizedResult {
     #[serde(rename = "type")]
     pub result_type: FindingType,
@@ -472,6 +503,13 @@ pub(crate) struct SanitizedResult {
     pub response: Option<String>,
 }
 
+/// `skip_serializing_if` predicate: leave a zero count out of the envelope
+/// entirely, so a field that describes an *exceptional* condition only appears
+/// when that condition actually happened.
+fn is_zero(n: &usize) -> bool {
+    *n == 0
+}
+
 /// Scan-level metadata envelope, previously only surfaced for JSON/JSONL.
 /// Now also threaded into SARIF (run.properties + driver.properties),
 /// Markdown (as additional summary tables), and TOML (as `[meta]` table).
@@ -499,6 +537,11 @@ pub(crate) struct ScanMetadata {
     /// coverage of that list.
     #[serde(default)]
     pub targets_deduplicated: usize,
+    /// Target-list lines that did not parse as a target and were skipped.
+    /// Omitted when zero (the normal case), so an envelope only carries it
+    /// when part of the input list was actually thrown away.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub targets_unparsable: usize,
     /// `--baseline` diff summary (path, mode, new/known counts, or the reason
     /// the diff was disabled). `None` when `--baseline` was not used, and then
     /// omitted from every rendered envelope.
@@ -648,6 +691,14 @@ impl Result {
             "dedup_mode": &meta.dedup_mode,
             "targets_deduplicated": meta.targets_deduplicated,
         });
+        if meta.targets_unparsable > 0
+            && let serde_json::Value::Object(ref mut map) = value
+        {
+            map.insert(
+                "targets_unparsable".to_string(),
+                serde_json::json!(meta.targets_unparsable),
+            );
+        }
         if let Some(baseline) = &meta.baseline
             && let serde_json::Value::Object(ref mut map) = value
         {

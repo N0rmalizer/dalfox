@@ -289,8 +289,8 @@ fn test_results_to_markdown() {
 
     // Check findings section
     assert!(markdown.contains("## Findings"));
-    assert!(markdown.contains("### 1. Vulnerability - q (inHTML)"));
-    assert!(markdown.contains("### 2. Reflection - data (inJS)"));
+    assert!(markdown.contains("### 1. Vulnerability - `q` (inHTML)"));
+    assert!(markdown.contains("### 2. Reflection - `data` (inJS)"));
 
     // Check table content
     assert!(markdown.contains("| **Type** | V |"));
@@ -773,7 +773,7 @@ fn test_results_to_markdown_with_meta() {
     assert!(md.contains("| **Total Requests** | 42 |"));
     assert!(md.contains("### Target Summary"));
     assert!(md.contains("| https://example.com | findings | 1 | Cloudflare |"));
-    assert!(md.contains("| https://ex2.com | skipped (CONNECTION_FAILED) | 0 | none |"));
+    assert!(md.contains("| https://ex2.com | skipped (CONNECTION\\_FAILED) | 0 | none |"));
     // still has the findings summary
     assert!(md.contains("## Summary"));
     assert!(md.contains("**Total Findings**: 1"));
@@ -881,4 +881,227 @@ fn test_informational_finding_omits_confidence_in_json() {
     assert_eq!(v["detection_method"], "library");
     assert!(v.get("confidence").is_none(), "got: {}", v);
     assert!(v.get("confidence_reason").is_none(), "got: {}", v);
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Markdown report — the target must not be able to write the report's shape
+// ─────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn markdown_param_cannot_forge_rows_or_headings() {
+    // A page naming its input `q| forged |\n\n## FORGED HEADING\n\nx` used to
+    // end up with a real heading and an extra table row inside the report.
+    let hostile = "q| forged |\n\n## FORGED HEADING\n\nx";
+    let result = Result::builder(FindingType::Verified)
+        .inject_type("inHTML")
+        .method("GET")
+        .data("https://example.com/")
+        .param(hostile)
+        .payload("<svg onload=alert(1)>")
+        .evidence("a | b")
+        .cwe("CWE-79")
+        .severity("High")
+        .message_id(606)
+        .message_str("XSS detected")
+        .build();
+    let md = Result::results_to_markdown(&[result], false, false);
+
+    assert!(
+        !md.lines().any(|l| l.trim_start().starts_with("## FORGED")),
+        "param forged a heading:\n{md}"
+    );
+    // The pipe is escaped, so the row still has exactly the two cells.
+    assert!(md.contains("| **Parameter** | `q\\| forged \\|"), "{md}");
+    assert!(md.contains("| **Evidence** | a \\| b |"), "{md}");
+    // …and the newlines are escaped rather than ending the table.
+    assert!(md.contains("\\n\\n## FORGED HEADING\\n\\nx"), "{md}");
+}
+
+#[test]
+fn markdown_target_text_cannot_create_a_link_inside_parameter_cells() {
+    // Parameter names can come directly from a page's form or query string.
+    // A backtick closes the fixed inline-code span used by the table, leaving
+    // the rest of this value active Markdown in both the heading and cell.
+    let hostile = "q` [click](https://attacker.example)";
+    let result = Result::builder(FindingType::Verified)
+        .inject_type("inHTML")
+        .method("GET")
+        .data("https://example.com/")
+        .param(hostile)
+        .payload("<svg onload=alert(1)>")
+        .cwe("CWE-79")
+        .severity("High")
+        .message_id(606)
+        .message_str("XSS detected")
+        .build();
+    let md = Result::results_to_markdown(&[result], false, false);
+
+    assert!(
+        md.contains("### 1. Vulnerability - ``q` [click](https://attacker.example)`` (inHTML)"),
+        "target text must stay inside a code span in the finding heading:\n{md}"
+    );
+    assert!(
+        md.contains("| **Parameter** | ``q` [click](https://attacker.example)`` |"),
+        "the parameter value must remain inside one code span:\n{md}"
+    );
+}
+
+#[test]
+fn markdown_finding_includes_type_description() {
+    let result = Result::builder(FindingType::Verified)
+        .inject_type("inHTML")
+        .method("GET")
+        .data("https://example.com/")
+        .param("q")
+        .payload("<svg onload=alert(1)>")
+        .cwe("CWE-79")
+        .severity("High")
+        .message_id(606)
+        .message_str("XSS detected")
+        .build();
+    let md = Result::results_to_markdown(&[result], false, false);
+
+    assert!(
+        md.contains("| **Type Description** | Vulnerable - dalfox asserts this input is exploitable; act on it |"),
+        "Markdown must pair the type code with its description:\n{md}"
+    );
+}
+
+#[test]
+fn sarif_finding_includes_type_description() {
+    let result = Result::builder(FindingType::Verified)
+        .inject_type("inHTML")
+        .method("GET")
+        .data("https://example.com/")
+        .param("q")
+        .payload("<svg onload=alert(1)>")
+        .cwe("CWE-79")
+        .severity("High")
+        .message_id(606)
+        .message_str("XSS detected")
+        .build();
+    let sarif = Result::results_to_sarif(&[result], false, false);
+    let value: serde_json::Value = serde_json::from_str(&sarif).expect("valid SARIF JSON");
+
+    assert_eq!(
+        value["runs"][0]["results"][0]["properties"]["type_description"],
+        "Vulnerable - dalfox asserts this input is exploitable; act on it"
+    );
+}
+
+#[test]
+fn markdown_control_bytes_in_cells_are_escaped() {
+    let result = Result::builder(FindingType::Verified)
+        .inject_type("inHTML")
+        .method("GET")
+        .data("https://example.com/\u{1b}]8;;http://evil/\u{7}")
+        .param("q")
+        .payload("<svg onload=alert(1)>")
+        .cwe("CWE-79")
+        .severity("High")
+        .message_id(606)
+        .message_str("XSS detected")
+        .build();
+    let md = Result::results_to_markdown(&[result], false, false);
+    assert!(!md.contains('\u{1b}') && !md.contains('\u{7}'), "{md:?}");
+    assert!(md.contains("\\\\x1b\\]8;;http://evil/\\\\x07"), "{md}");
+    // Payload punctuation is untouched.
+    assert!(md.contains("<svg onload=alert(1)>"), "{md}");
+}
+
+#[test]
+fn markdown_code_fence_outgrows_backticks_in_the_body() {
+    // A response echoed under --include-response can contain ``` and used to
+    // close the fence early, spilling the rest into the document as Markdown.
+    let mut result = Result::builder(FindingType::Verified)
+        .inject_type("inHTML")
+        .method("GET")
+        .data("https://example.com/")
+        .param("q")
+        .payload("<svg onload=alert(1)>")
+        .cwe("CWE-79")
+        .severity("High")
+        .message_id(606)
+        .message_str("XSS detected")
+        .build();
+    result.response = Some("HTTP/1.1 200 OK\r\n\r\n```\n## NOT A HEADING\n```".to_string());
+    let md = Result::results_to_markdown(&[result], false, true);
+    let (_, fenced) = md
+        .split_once("**Response:**\n\n")
+        .expect("response section");
+    assert!(
+        fenced.starts_with("````http\n"),
+        "fence must outgrow the body:\n{md}"
+    );
+    // The body's own ``` lines sit between the opening and closing 4-backtick
+    // fences, so nothing after them is read as Markdown.
+    let (block, _) = fenced
+        .split_once("\n````\n")
+        .expect("closing fence of the same length");
+    assert!(block.contains("```\n## NOT A HEADING\n```"), "{md}");
+}
+
+#[test]
+fn markdown_payload_cell_keeps_waf_bypass_whitespace() {
+    // `payload::xss_html` ships `<img\x0csrc=x\x0conerror=…>`; the Payload
+    // cell is what a reader copies to reproduce, so those bytes must survive.
+    let result = Result::builder(FindingType::Verified)
+        .inject_type("inHTML")
+        .method("GET")
+        .data("https://example.com/")
+        .param("q")
+        .payload("<img\u{c}src=x\u{c}onerror=alert(1)>")
+        .cwe("CWE-79")
+        .severity("High")
+        .message_id(606)
+        .message_str("XSS detected")
+        .build();
+    let md = Result::results_to_markdown(&[result], false, false);
+    assert!(
+        md.contains("<img\u{c}src=x\u{c}onerror=alert(1)>"),
+        "{md:?}"
+    );
+}
+
+#[test]
+fn unparsable_target_lines_surface_in_every_envelope() {
+    // A run that discarded part of its input list must never read as full
+    // coverage of that list — the same contract `targets_deduplicated` has.
+    let meta = ScanMetadata {
+        targets_unparsable: 7,
+        ..mk_meta()
+    };
+
+    let json = Result::make_scan_meta_value(&meta);
+    assert_eq!(json["targets_unparsable"], serde_json::json!(7));
+
+    let md = Result::results_to_markdown_with_meta(&[], false, false, Some(&meta));
+    assert!(
+        md.contains("| **Targets Unparsable** | 7 list line(s) skipped |"),
+        "markdown meta table missing the row:\n{md}"
+    );
+
+    // Serde carries it into the formats that serialize the struct directly.
+    let serialized = serde_json::to_value(&meta).expect("meta serializes");
+    assert_eq!(serialized["targets_unparsable"], serde_json::json!(7));
+}
+
+#[test]
+fn a_clean_run_carries_no_unparsable_field_at_all() {
+    // Zero is the normal case: it must not add a field to every envelope, and
+    // it must not add a row to the Markdown table.
+    let meta = mk_meta();
+    assert_eq!(meta.targets_unparsable, 0);
+
+    let json = Result::make_scan_meta_value(&meta);
+    assert!(
+        json.get("targets_unparsable").is_none(),
+        "zero must be omitted from the JSON envelope: {json}"
+    );
+
+    let md = Result::results_to_markdown_with_meta(&[], false, false, Some(&meta));
+    assert!(!md.contains("Targets Unparsable"), "{md}");
+
+    let serialized = serde_json::to_value(&meta).expect("meta serializes");
+    assert!(serialized.get("targets_unparsable").is_none());
 }

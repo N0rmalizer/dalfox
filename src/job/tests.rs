@@ -352,10 +352,15 @@ fn cancelled_job_with_a_live_worker_is_not_evictable() {
         !job.is_evictable(),
         "retention must not collect a job a worker is still writing to"
     );
+    assert!(
+        !job.is_settled(),
+        "explicit deletion must wait for the lease"
+    );
 
     // Worker finishes (or panics): the lease drops and the entry is collectable.
     drop(lease);
     assert!(!job.worker_alive());
+    assert!(job.is_settled());
     assert!(job.is_evictable());
 }
 
@@ -447,6 +452,10 @@ fn a_wedged_worker_stops_holding_its_slot_after_the_drain_grace() {
     assert!(
         job.is_evictable(),
         "and its map entry must become collectable"
+    );
+    assert!(
+        !job.is_settled(),
+        "retention grace must not make explicit deletion unsafe"
     );
 }
 
@@ -912,4 +921,435 @@ fn test_validate_remote_providers_error_cannot_forge_a_log_line() {
         !err.contains('\n') && !err.contains('\r'),
         "raw CRLF in: {err}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// REST ↔ MCP accepted-option parity
+// ---------------------------------------------------------------------------
+
+/// Every spelling a `deny_unknown_fields` struct accepts, recovered from the
+/// error serde raises for an unknown key ("unknown field `x`, expected one of
+/// `a`, `b`, …"). Reading it back out of serde is what makes this a real drift
+/// guard: it sees the `#[serde(alias)]`es too, which no hand-written list or
+/// JSON-schema dump would, and it cannot go stale when a field is added.
+fn accepted_field_names<T: serde::de::DeserializeOwned>() -> std::collections::BTreeSet<String> {
+    // A key no surface will ever define, so the error is always the unknown-field one.
+    let probe = serde_json::json!({ "zzz_not_a_real_field_zzz": null });
+    let err = serde_json::from_value::<T>(probe)
+        .err()
+        .expect("the struct must carry #[serde(deny_unknown_fields)]")
+        .to_string();
+    let list = err
+        .split_once("expected one of ")
+        .unwrap_or_else(|| panic!("unexpected serde unknown-field error shape: {err}"))
+        .1;
+    list.split(", ")
+        .map(|f| f.trim().trim_matches('`').to_string())
+        .filter(|f| !f.is_empty())
+        .collect()
+}
+
+/// The silent-false-clean guard, at the surface level. An agent that read one
+/// front-end's docs and called the other used to have the mismatched options
+/// dropped on the floor — a scan with no cookies and no headers, reported as a
+/// clean `done`. Both surfaces now refuse unknown keys, which only stays usable
+/// because each accepts the other's spellings; this pins that neither half can
+/// drift away on its own.
+///
+/// A new option on one side must either be added to the other or listed here
+/// with the reason it is deliberately one-sided.
+#[test]
+fn rest_and_mcp_accept_the_same_scan_option_names() {
+    use std::collections::BTreeSet;
+
+    // The REST surface is split across the envelope (`target`/`url`) and the
+    // nested option dict; the MCP surface is one flat object.
+    let mut rest = accepted_field_names::<crate::server::types::ScanRequest>();
+    rest.extend(accepted_field_names::<crate::server::types::ScanOptions>());
+    // Structural, not an option: REST nests options, MCP does not.
+    rest.remove("options");
+
+    let mcp = accepted_field_names::<crate::mcp::ScanWithDalfoxParams>();
+
+    /// Result-delivery webhook. Kept off the agent-facing surface on purpose:
+    /// it would hand a model a channel to ship scan output (target URLs,
+    /// reflected payloads, response excerpts) to a host of its choosing.
+    const REST_ONLY: &[&str] = &["callback_url"];
+    /// Call-transport knobs for a single tool invocation. REST has no
+    /// equivalent because a REST client polls `GET /scan/{id}` instead.
+    const MCP_ONLY: &[&str] = &["wait", "wait_timeout_sec"];
+
+    let rest_only: BTreeSet<_> = REST_ONLY.iter().map(ToString::to_string).collect();
+    let mcp_only: BTreeSet<_> = MCP_ONLY.iter().map(ToString::to_string).collect();
+
+    let missing_on_mcp: Vec<_> = rest
+        .difference(&mcp)
+        .filter(|f| !rest_only.contains(*f))
+        .collect();
+    assert!(
+        missing_on_mcp.is_empty(),
+        "REST accepts these scan options but MCP refuses them, so an agent \
+         reusing its REST arguments gets a hard error (or, worse, a scan \
+         missing them): {missing_on_mcp:?}. Add them to ScanWithDalfoxParams, \
+         or document them in REST_ONLY."
+    );
+
+    let missing_on_rest: Vec<_> = mcp
+        .difference(&rest)
+        .filter(|f| !mcp_only.contains(*f))
+        .collect();
+    assert!(
+        missing_on_rest.is_empty(),
+        "MCP accepts these scan options but REST refuses them: \
+         {missing_on_rest:?}. Add them to ScanOptions, or document them in MCP_ONLY."
+    );
+
+    // The exclusion lists must stay honest: an entry that is actually accepted
+    // on both sides is a stale exemption hiding a real divergence later.
+    for f in &rest_only {
+        assert!(
+            rest.contains(f),
+            "REST_ONLY names `{f}`, which REST does not accept"
+        );
+        assert!(
+            !mcp.contains(f),
+            "REST_ONLY names `{f}`, but MCP accepts it"
+        );
+    }
+    for f in &mcp_only {
+        assert!(
+            mcp.contains(f),
+            "MCP_ONLY names `{f}`, which MCP does not accept"
+        );
+        assert!(
+            !rest.contains(f),
+            "MCP_ONLY names `{f}`, but REST accepts it"
+        );
+    }
+}
+
+/// Parity of *names* is only half of it: the REST-spelled values have to reach
+/// `ScanArgs`. The whole point is that an agent using `cookie`/`header`/
+/// `worker`/`blind` on the MCP tool gets an authenticated scan, not a
+/// zero-finding one.
+#[test]
+fn mcp_rest_spellings_reach_scan_args() {
+    let p: crate::mcp::ScanWithDalfoxParams = serde_json::from_value(serde_json::json!({
+        "url": "http://example.com/?q=1",
+        "cookie": "sid=abc; lang=en",
+        "header": ["Authorization: Bearer t"],
+        "worker": 9,
+        "blind": "http://cb.example/x",
+    }))
+    .expect("REST-spelled MCP arguments deserialize");
+
+    let args = ScanRequestSpec {
+        target: p.target.clone(),
+        headers: p.headers.clone(),
+        cookies: p.cookies.clone(),
+        blind_callback_url: p.blind_callback_url.clone(),
+        workers: p.workers,
+        ..Default::default()
+    }
+    .into_scan_args();
+
+    assert_eq!(args.targets, vec!["http://example.com/?q=1".to_string()]);
+    assert_eq!(args.cookies, vec!["sid=abc; lang=en".to_string()]);
+    assert_eq!(args.headers, vec!["Authorization: Bearer t".to_string()]);
+    assert_eq!(args.workers, 9);
+    assert_eq!(
+        args.blind_callback_url.as_deref(),
+        Some("http://cb.example/x")
+    );
+
+    // Same request in REST's own shape lands on exactly the same values — the
+    // two spellings are one option, not two behaviours.
+    let rest = ScanRequestSpec::from_rest_options(
+        "http://example.com/?q=1".to_string(),
+        &serde_json::from_value::<crate::server::types::ScanOptions>(serde_json::json!({
+            "cookie": "sid=abc; lang=en",
+            "header": ["Authorization: Bearer t"],
+            "worker": 9,
+            "blind": "http://cb.example/x",
+        }))
+        .expect("REST options deserialize"),
+        false,
+        false,
+        0,
+        0,
+        None,
+    )
+    .into_scan_args();
+    assert_eq!(rest.cookies, args.cookies);
+    assert_eq!(rest.headers, args.headers);
+    assert_eq!(rest.workers, args.workers);
+    assert_eq!(rest.blind_callback_url, args.blind_callback_url);
+}
+
+/// `preflight_dalfox` deliberately accepts a *subset* of the scan options: it
+/// sends no payloads, so most of them describe nothing it does. REST has no
+/// such tool — `POST /preflight` deserializes the same `ScanRequest` as
+/// `POST /scan` and ignores what it cannot use — so `deny_unknown_fields` on
+/// the MCP side makes this the one place the two surfaces genuinely diverge.
+///
+/// That divergence is a deliberate trade, not an oversight. An option refused
+/// here costs one retry against an error that names it, and preflight returns
+/// an *estimate*: a wrong one is visibly wrong. The scan tool's silent drop
+/// cost an unauthenticated scan reported as clean, which is not recoverable at
+/// all — which is why that surface takes the aliases and this one does not
+/// grow fields it would only ignore.
+///
+/// The list below is the whole of it. A field added to the scan tool lands
+/// here until it is either mirrored onto preflight or written down as
+/// something preflight has no use for.
+#[test]
+fn preflight_accepts_a_documented_subset_of_the_scan_options() {
+    use std::collections::BTreeSet;
+
+    let scan = accepted_field_names::<crate::mcp::ScanWithDalfoxParams>();
+    let preflight = accepted_field_names::<crate::mcp::PreflightDalfoxParams>();
+
+    /// Scan options preflight does not accept, each because it describes
+    /// behaviour preflight has not got: it sends no payloads, spawns no
+    /// workers, runs no WAF probe, and always returns inline.
+    const NOT_ON_PREFLIGHT: &[&str] = &[
+        // No payloads are sent, so nothing to pace, bound, or parallelize.
+        "delay",
+        "scan_timeout",
+        "rate_limit",
+        "worker",
+        "workers",
+        // No payloads means no blind injection and no WAF interaction.
+        "blind",
+        "blind_callback_url",
+        "waf_bypass",
+        "skip_waf_probe",
+        "force_waf",
+        "waf_evasion",
+        "waf_min_confidence",
+        // Nothing is fetched to fuel an attack the caller has not run yet.
+        "remote_payloads",
+        "remote_wordlists",
+        // There are no findings to attach raw traffic to.
+        "include_request",
+        "include_response",
+        // Analysis switches for a scan, not for discovery.
+        "skip_ast_analysis",
+        "analyze_external_js",
+        "detect_outdated_libs",
+        // Preflight is already blocking; it has nothing to wait on.
+        "wait",
+        "wait_timeout_sec",
+    ];
+
+    let exempt: BTreeSet<_> = NOT_ON_PREFLIGHT.iter().map(ToString::to_string).collect();
+
+    let unexplained: Vec<_> = scan
+        .difference(&preflight)
+        .filter(|f| !exempt.contains(*f))
+        .collect();
+    assert!(
+        unexplained.is_empty(),
+        "these scan options are refused by preflight with no reason recorded: \
+         {unexplained:?}. Either mirror them onto PreflightDalfoxParams, or add \
+         them to NOT_ON_PREFLIGHT with why preflight cannot use them."
+    );
+
+    // Preflight must not accept something the scan tool refuses: its whole job
+    // is to describe the scan that follows.
+    let preflight_only: Vec<_> = preflight.difference(&scan).collect();
+    assert!(
+        preflight_only.is_empty(),
+        "preflight accepts options the scan tool does not: {preflight_only:?}"
+    );
+
+    // Keep the exemption list honest — a stale entry would silently widen it.
+    for f in &exempt {
+        assert!(
+            scan.contains(f),
+            "NOT_ON_PREFLIGHT names `{f}`, which the scan tool does not accept either"
+        );
+        assert!(
+            !preflight.contains(f),
+            "NOT_ON_PREFLIGHT names `{f}`, but preflight accepts it"
+        );
+    }
+
+    // The cross-surface spellings that carry credentials or name the target do
+    // reach preflight: sending it without cookies would under-report the
+    // parameters an authenticated scan would find.
+    for aliased in ["url", "cookie", "cookies", "header", "headers"] {
+        assert!(
+            preflight.contains(aliased),
+            "preflight must accept `{aliased}` — it shapes what discovery sees"
+        );
+    }
+}
+
+/// The server / MCP runner derives the same target state from its preflight
+/// GET that the CLI preflight does. It used to use that response for the
+/// initial AST pass only, so a REST/MCP job never fingerprinted a WAF (and
+/// `force_waf` / `waf_bypass` were silent no-ops), never analysed the page's
+/// CSP (no CSP-bypass payloads, no Trusted Types posture for the scan-phase
+/// AST), never fingerprinted the stack, and ignored `detect_outdated_libs`.
+#[tokio::test]
+async fn execute_scan_derives_waf_csp_tech_and_outdated_libs_like_the_cli() {
+    use axum::{Router, http::HeaderMap, response::IntoResponse, routing::get};
+
+    async fn page() -> impl IntoResponse {
+        let mut h = HeaderMap::new();
+        h.insert("cf-ray", "8a1b2c3d4e5f-ICN".parse().unwrap());
+        h.insert("server", "cloudflare".parse().unwrap());
+        h.insert(
+            "content-security-policy",
+            "script-src 'self'".parse().unwrap(),
+        );
+        h.insert("content-type", "text/html".parse().unwrap());
+        (
+            h,
+            r#"<html><head><script src="/static/jquery-1.7.2.min.js"></script></head><body>ok</body></html>"#,
+        )
+    }
+
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, Router::new().route("/", get(page))).await;
+    });
+
+    let mut target =
+        crate::target_parser::parse_target(&format!("http://{addr}/")).expect("valid target");
+    let args = Arc::new(crate::cmd::scan::ScanArgs {
+        skip_discovery: true,
+        skip_mining: true,
+        skip_waf_probe: true,
+        detect_outdated_libs: true,
+        silence: true,
+        ..Default::default()
+    });
+    let progress = JobProgress::default();
+    let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    let run =
+        crate::job::runner::execute_scan(&mut target, &args, &progress, &cancel, &|_| {}).await;
+
+    let waf = target.waf_info.as_ref().expect("passive WAF fingerprint");
+    assert!(
+        waf.waf_types()
+            .iter()
+            .any(|t| matches!(t, crate::waf::WafType::Cloudflare)),
+        "cf-ray/server headers must fingerprint Cloudflare: {waf:?}"
+    );
+    assert!(
+        target.mutation_stats.is_some(),
+        "bypass is on by default, so mutation stats are tracked"
+    );
+    let csp = target.csp_analysis.as_ref().expect("CSP analysed");
+    assert!(!csp.report_only && !csp.missing_script_src);
+    let results = run.results.lock().await;
+    assert!(
+        results.iter().any(|r| r.cwe == "CWE-1104"),
+        "detect_outdated_libs must report jQuery 1.7.2"
+    );
+}
+
+/// `force_waf` needs no fingerprint at all; `waf_bypass=off` keeps detection
+/// but must not arm the bypass state.
+#[tokio::test]
+async fn execute_scan_honours_force_waf_and_waf_bypass_off() {
+    use axum::{Router, routing::get};
+
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    tokio::spawn(async move {
+        let _ = axum::serve(
+            listener,
+            Router::new().route("/", get(|| async { "plain" })),
+        )
+        .await;
+    });
+
+    for (bypass, armed) in [("auto", true), ("off", false)] {
+        let mut target =
+            crate::target_parser::parse_target(&format!("http://{addr}/")).expect("valid target");
+        let args = Arc::new(crate::cmd::scan::ScanArgs {
+            skip_discovery: true,
+            skip_mining: true,
+            skip_waf_probe: true,
+            force_waf: Some("akamai".to_string()),
+            waf_bypass: bypass.to_string(),
+            silence: true,
+            ..Default::default()
+        });
+        let progress = JobProgress::default();
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        crate::job::runner::execute_scan(&mut target, &args, &progress, &cancel, &|_| {}).await;
+
+        let waf = target.waf_info.as_ref().expect("forced WAF recorded");
+        assert!(
+            waf.waf_types()
+                .iter()
+                .any(|t| matches!(t, crate::waf::WafType::Akamai)),
+            "force_waf must be honoured (waf_bypass={bypass})"
+        );
+        assert_eq!(
+            target.mutation_stats.is_some(),
+            armed,
+            "bypass state armed only when waf_bypass != off (waf_bypass={bypass})"
+        );
+        assert_eq!(
+            crate::scanning::compute_waf_strategy(&target, &args).is_some(),
+            armed
+        );
+    }
+}
+
+/// The reachability probe goes out like any other scan request: one
+/// `User-Agent` (a job's UA is in both `target.headers` and
+/// `target.user_agent`) and one `Cookie` (a caller's `Cookie` header wins over
+/// the composed jar, as everywhere else).
+#[tokio::test]
+async fn reachability_probe_sends_each_header_once() {
+    use axum::{Router, http::HeaderMap, routing::get};
+    use std::sync::Mutex as StdMutex;
+
+    let seen: Arc<StdMutex<Vec<(usize, usize)>>> = Arc::new(StdMutex::new(Vec::new()));
+    let seen_handler = seen.clone();
+    let app = Router::new().route(
+        "/",
+        get(move |headers: HeaderMap| {
+            let seen = seen_handler.clone();
+            async move {
+                seen.lock().unwrap().push((
+                    headers.get_all("user-agent").iter().count(),
+                    headers.get_all("cookie").iter().count(),
+                ));
+                "ok"
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let server = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    let mut target =
+        crate::target_parser::parse_target(&format!("http://{addr}/")).expect("valid target");
+    target.headers = vec![
+        ("User-Agent".to_string(), "job-agent".to_string()),
+        ("Cookie".to_string(), "sid=hdr".to_string()),
+    ];
+    target.user_agent = Some("job-agent".to_string());
+    target.cookies = vec![("theme".to_string(), "dark".to_string())];
+
+    assert!(send_reachability_probe(&target).await);
+    server.abort();
+    assert_eq!(*seen.lock().unwrap(), vec![(1, 1)]);
 }

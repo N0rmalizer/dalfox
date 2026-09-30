@@ -123,6 +123,9 @@ pub(crate) async fn render_dry_run(
             "dedup_mode": state.dedup.mode,
             "targets_deduplicated": state.dedup.collapsed,
         });
+        if state.unparsable_lines > 0 {
+            meta["targets_unparsable"] = serde_json::json!(state.unparsable_lines);
+        }
         // The resume filter has already been applied to this plan, so the
         // counts above describe what is *left* to scan, not the input list.
         if let Some(sf) = &state.state_file {
@@ -156,6 +159,13 @@ pub(crate) async fn render_dry_run(
                 out,
                 "  Targets (deduped):   {} ({} mode)",
                 state.dedup.collapsed, state.dedup.mode
+            );
+        }
+        if state.unparsable_lines > 0 {
+            let _ = writeln!(
+                out,
+                "  Targets (unparsable): {} list line(s) skipped",
+                state.unparsable_lines
             );
         }
         if state.resumed_skipped > 0 {
@@ -408,7 +418,7 @@ impl RequestTally {
     /// signal. Requiring a floor on the absolute count too keeps the flag
     /// meaningful on short runs while still catching a small run that lost
     /// nearly everything (5 sent, 5 failed is 5 failures, not noise).
-    fn is_incomplete(&self) -> bool {
+    pub(crate) fn is_incomplete(&self) -> bool {
         self.failed >= INCOMPLETE_MIN_FAILURES && self.failure_ratio() >= INCOMPLETE_FAILURE_RATIO
     }
 }
@@ -427,6 +437,58 @@ const INCOMPLETE_FAILURE_RATIO: f64 = 0.10;
 /// [`RequestTally::is_incomplete`]. Two lost requests can be one flaky hop, so
 /// the flag needs a third before it claims the run was not really scanned.
 const INCOMPLETE_MIN_FAILURES: u64 = 3;
+
+/// The per-finding blocks of the plain report.
+///
+/// `streamed` is the set the `--stream-findings` printer recorded when it ran.
+/// The findings it emitted mid-scan are not rendered again — that produced the
+/// duplicate POC headers users reported — but everything it never saw (the
+/// initial AST pass, external JS, outdated libs, OOB callbacks, none of which
+/// go through `run_scanning`) is rendered here. Skipping every block whenever
+/// streaming was on counted those findings in the summary line and showed them
+/// nowhere.
+pub(crate) fn render_plain_finding_blocks(
+    args: &ScanArgs,
+    display_results: &[Result],
+    streamed: Option<&std::collections::HashSet<String>>,
+) -> String {
+    let mut output = String::new();
+    for result in display_results {
+        if streamed.is_some_and(|s| s.contains(&stream_key(result))) {
+            continue;
+        }
+        output.push_str(&render_finding_block(
+            result,
+            &args.poc_type,
+            args.include_request,
+            args.include_response,
+        ));
+    }
+    output
+}
+
+/// Identity the `--stream-findings` printer dedups on and records, so the
+/// end-of-scan renderer can tell which findings it already printed.
+///
+/// AST findings use the same fingerprint as [`super::postprocess::dedupe_ast_results`]
+/// (plus the type): one page-level sink is re-found by every parameter's AST
+/// pass with that parameter's name on it, and the final report folds those
+/// into a single finding. Keying them by `param` printed one block per
+/// parameter live and then the folded survivor a further time at the end. The
+/// type stays in the key so a stronger survivor (an `A` upgraded to `V`) is
+/// still shown at the end.
+pub(crate) fn stream_key(result: &Result) -> String {
+    if let Some(ast_key) = super::postprocess::ast_dedup_key(result) {
+        return format!("{}|ast|{}", result.result_type.short(), ast_key);
+    }
+    format!(
+        "{}|{}|{}|{}",
+        result.result_type.short(),
+        result.data,
+        result.param,
+        result.payload,
+    )
+}
 
 pub(crate) async fn render_results(
     args: &ScanArgs,
@@ -624,6 +686,7 @@ pub(crate) async fn render_results(
         target_summary,
         dedup_mode: state.dedup.mode.to_string(),
         targets_deduplicated: state.dedup.collapsed,
+        targets_unparsable: state.unparsable_lines,
         baseline: baseline_meta,
         resumed: state.state_file.as_ref().map(|sf| {
             serde_json::json!({
@@ -719,28 +782,23 @@ pub(crate) async fn render_results(
             );
         }
 
-        // When the streaming printer ran (`stream_findings_enabled`), every
-        // finding has already been emitted mid-scan with its full block —
-        // re-rendering here would produce the duplicate POC headers users
-        // reported. Skip per-finding rendering in that case and let the
-        // summary line above stand alone.
-        if !stream_findings_enabled {
-            for result in display_results {
-                output.push_str(&render_finding_block(
-                    result,
-                    &args.poc_type,
-                    args.include_request,
-                    args.include_response,
-                ));
-            }
-        }
+        let streamed = state.streamed_findings.lock().await;
+        output.push_str(&render_plain_finding_blocks(
+            args,
+            display_results,
+            stream_findings_enabled.then_some(&*streamed),
+        ));
         output
     } else {
         let mut output = String::new();
         for result in display_results {
+            // The parameter name is target-derived (page forms, parameter
+            // mining) and unfiltered — escape control bytes before it reaches
+            // the terminal or a report file.
             output.push_str(&format!(
                 "Found XSS: {} - {}\n",
-                result.param, result.payload
+                crate::utils::term::sanitize_display(&result.param),
+                crate::utils::term::sanitize_display(&result.payload)
             ));
         }
         output
@@ -749,6 +807,27 @@ pub(crate) async fn render_results(
     let output_write_failed = write_output_or_stdout(args, &output_content);
 
     (final_results, output_write_failed)
+}
+
+/// Create-or-truncate `path` and write `content`, `0600` on Unix.
+///
+/// A report is at least as sensitive as the server's `--log-file` (already
+/// `0600`): under `--include-request` it embeds the raw request, which
+/// carries every `-H` header and the whole cookie jar — the session that made
+/// the target worth scanning. `std::fs::write` left it `0644`, readable by
+/// every local account on the host. The mode only applies at creation, so an
+/// existing file keeps whatever permissions the operator gave it, and the
+/// overwrite-on-rerun behaviour is unchanged.
+fn write_report_file(path: &str, content: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    opts.open(path)?.write_all(content.as_bytes())
 }
 
 /// Write a rendered report to `--output`, or to stdout when no file was asked
@@ -793,7 +872,7 @@ fn write_output_or_stdout(args: &ScanArgs, output_content: &str) -> bool {
         if !file_content.ends_with('\n') {
             file_content.push('\n');
         }
-        match std::fs::write(output_path, &file_content) {
+        match write_report_file(output_path, &file_content) {
             Ok(_) => {
                 if !args.silence {
                     println!("Results written to {}", output_path);
@@ -832,6 +911,7 @@ pub(crate) async fn derive_outcome(
     all_target_urls: &[String],
     state: &ScanState,
     final_results: &[Result],
+    requests: RequestTally,
     output_write_failed: bool,
 ) -> ScanOutcome {
     // A scan where every supplied target failed reachability checks
@@ -872,11 +952,37 @@ pub(crate) async fn derive_outcome(
         return ScanOutcome::Error;
     }
 
+    // A target whose per-parameter worker panicked was recorded
+    // `INTERNAL_ERROR` in `skipped_targets` (scan_loop) — it was not fully
+    // tested. On a single-target run `all_unreachable` above already caught
+    // it, but with a healthy sibling that check is false, so an empty report
+    // would fall through to Clean (exit 0): the "a panic reads as a clean
+    // scan" class, unfixed for the *aggregate* code. Escalate here. Gated on
+    // no findings for the same reason as the session-loss block: a run that
+    // confirmed a `V` elsewhere should still exit 1, not 2 — `meta.incomplete`
+    // and the per-target INTERNAL_ERROR entry carry the partial-ness either way.
+    if final_results.is_empty() {
+        let skipped = state.skipped_targets.lock().await;
+        if skipped
+            .values()
+            .any(|code| *code == crate::cmd::error_codes::INTERNAL_ERROR)
+        {
+            return ScanOutcome::Error;
+        }
+    }
+
     // A requested `--output` file that couldn't be written is a hard failure,
     // same as an all-unreachable run: the operator asked for results on disk and
     // didn't get them. Report it via the exit code so scripts don't read it as a
     // clean/successful pass.
     if output_write_failed {
+        return ScanOutcome::Error;
+    }
+
+    // The result envelope already marks severe transport loss as incomplete.
+    // Keep the CLI exit status consistent: with no finding, a run that failed
+    // to deliver enough requests did not establish a clean result.
+    if final_results.is_empty() && requests.is_incomplete() {
         return ScanOutcome::Error;
     }
 

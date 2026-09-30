@@ -2181,6 +2181,37 @@ fn test_occurrence_inside_url_attr_value_handles_query_string() {
 // `build_hpp_url` degrades here rather than at the call site.
 // ---------------------------------------------------------------------------
 
+#[test]
+fn hpp_response_gate_requires_a_browser_executable_response_type() {
+    let markup_payload = "<script>alert(1)</script>";
+    let json = format!("{{\"q\":\"{markup_payload}\"}}");
+    assert!(!hpp_response_has_executable_reflection(
+        markup_payload,
+        "application/json",
+        &json
+    ));
+    assert!(!hpp_response_has_executable_reflection(
+        markup_payload,
+        "text/plain; charset=utf-8",
+        markup_payload
+    ));
+    assert!(hpp_response_has_executable_reflection(
+        markup_payload,
+        "text/html",
+        markup_payload
+    ));
+    assert!(!hpp_response_has_executable_reflection(
+        markup_payload,
+        "application/javascript",
+        markup_payload
+    ));
+    assert!(hpp_response_has_executable_reflection(
+        "alert(1);foo",
+        "application/javascript",
+        "alert(1);foo({\"data\":1})"
+    ));
+}
+
 /// Happy path: the duplicated-parameter URL is sent verbatim and the payload
 /// echoed by the server is classified as a reflection, with the body returned
 /// as evidence.
@@ -2619,7 +2650,7 @@ mod status_path {
         let args = default_scan_args();
         let streak = std::sync::atomic::AtomicU32::new(0);
 
-        let (kind, body, status) =
+        let (kind, body, status, _) =
             crate::scanning::check_reflection::check_reflection_with_response_status(
                 None, &target, &param, payload, &args, &streak,
             )
@@ -2660,7 +2691,7 @@ mod status_path {
         let args = default_scan_args();
         let streak = std::sync::atomic::AtomicU32::new(0);
 
-        let (_kind, _body, status) =
+        let (_kind, _body, status, _) =
             crate::scanning::check_reflection::check_reflection_with_response_status(
                 None, &target, &param, payload, &args, &streak,
             )
@@ -3095,4 +3126,75 @@ mod escaped_echo {
             "an escaped echo in plain text is inert and must still advance the budget"
         );
     }
+}
+
+/// The stored-XSS check fetches each candidate URL with the operator's headers
+/// and cookies attached, so a page-derived `form_action_url` pointing off-origin
+/// must not become a candidate. `--sxss-url` is deliberately exempt: that one is
+/// the operator's own choice.
+#[test]
+fn resolve_sxss_check_urls_drops_a_cross_origin_form_action() {
+    let target = parse_target("https://example.com/page").unwrap();
+    let args = default_scan_args();
+
+    for action in [
+        "https://attacker.example/collect",
+        "https://attacker.example\\@example.com/collect",
+    ] {
+        let param = Param {
+            form_action_url: Some(action.to_string()),
+            form_origin_url: Some("https://example.com/page".to_string()),
+            ..Param::new("comment", "", Location::Body)
+        };
+        let urls = resolve_sxss_check_urls(&target, &param, &args);
+        assert!(
+            urls.iter().all(|u| u.host_str() == Some("example.com")),
+            "cross-origin action {action} leaked into the sxss check URLs: {:?}",
+            urls.iter().map(|u| u.as_str()).collect::<Vec<_>>()
+        );
+    }
+
+    // A same-origin action is still checked, so the assertion above cannot pass
+    // by the list simply being empty.
+    let param = Param {
+        form_action_url: Some("https://example.com/stored".to_string()),
+        form_origin_url: Some("https://example.com/page".to_string()),
+        ..Param::new("comment", "", Location::Body)
+    };
+    let urls = resolve_sxss_check_urls(&target, &param, &args);
+    assert!(
+        urls.iter()
+            .any(|u| u.as_str() == "https://example.com/stored"),
+        "same-origin action must still be checked, got {:?}",
+        urls.iter().map(|u| u.as_str()).collect::<Vec<_>>()
+    );
+}
+
+/// Counterpart to the cross-origin test: a same-host `http` -> `https` action is
+/// not foreign, and must still be fetched as a stored-XSS check URL.
+#[test]
+fn resolve_sxss_check_urls_keeps_a_same_host_tls_upgrade() {
+    let target = parse_target("http://example.com/page").unwrap();
+    let param = Param {
+        form_action_url: Some("https://example.com/stored".to_string()),
+        form_origin_url: Some("http://example.com/page".to_string()),
+        ..Param::new("comment", "", Location::Body)
+    };
+    let urls = resolve_sxss_check_urls(&target, &param, &default_scan_args());
+    assert!(
+        urls.iter()
+            .any(|u| u.as_str() == "https://example.com/stored"),
+        "TLS-upgraded action must still be checked, got {:?}",
+        urls.iter().map(|u| u.as_str()).collect::<Vec<_>>()
+    );
+}
+
+/// The script range starts after the open tag's real `>`: an attribute value
+/// holding `>` is not script content.
+#[test]
+fn test_script_block_ranges_skip_quoted_gt_in_open_tag() {
+    let html = r#"<script data-x="a>b">var x=1;</script>"#;
+    let ranges = script_block_ranges(html);
+    assert_eq!(ranges.len(), 1);
+    assert_eq!(&html[ranges[0].0..ranges[0].1], "var x=1;");
 }

@@ -107,7 +107,7 @@ pub(crate) use waf_strategy::*;
 
 use crate::cmd::scan::ScanArgs;
 use crate::parameter_analysis::Param;
-use crate::scanning::check_dom_verification::check_dom_verification_with_client_outcome;
+use crate::scanning::check_dom_verification::check_dom_verification_with_evidence;
 use crate::scanning::check_reflection::check_reflection_with_response_tracked;
 use crate::scanning::result::FindingType;
 use crate::target_parser::Target;
@@ -544,6 +544,7 @@ impl ScanWorkerCtx {
         Option<check_reflection::ReflectionKind>,
         Option<check_reflection::ReflectionBody>,
         u16,
+        bool,
     ) {
         let _permit = self.req_budget.acquire().await;
         check_reflection::check_reflection_with_response_status(
@@ -563,9 +564,9 @@ impl ScanWorkerCtx {
         &self,
         param: &Param,
         payload: &str,
-    ) -> crate::scanning::check_dom_verification::DomVerifyOutcome {
+    ) -> crate::scanning::check_dom_verification::DomVerifyEvidenceOutcome {
         let _permit = self.req_budget.acquire().await;
-        check_dom_verification_with_client_outcome(
+        check_dom_verification_with_evidence(
             self.client.as_ref(),
             &self.target,
             param,
@@ -663,36 +664,135 @@ impl ScanWorkerCtx {
 
         // If probe found no reflection and not in deep_scan, skip heavy
         // payload loops for this param.
-        if !probe_reflected && !self.args.deep_scan {
+        if !probe_reflected && !self.args.deep_scan && param.xml_namespace_candidate.is_none() {
             self.flush_results(&mut state.local_results).await;
             return;
         }
 
-        // Save a reference copy for the HPP phase (only first 5 payloads)
-        // before the reflection phase consumes `reflection_payloads`. Gate on
-        // the same condition `run_hpp_phase` checks (Query location) so we don't
-        // clone payloads for params whose HPP phase would immediately return.
-        let hpp_payloads: Vec<String> =
-            if self.args.hpp && param.location == crate::parameter_analysis::Location::Query {
-                reflection_payloads.iter().take(5).cloned().collect()
-            } else {
-                vec![]
+        // Under `--sxss`, snapshot this parameter's retrieval pages once, before
+        // it injects anything, so the reflection/DOM phases can tell a payload
+        // *this* parameter stored from one another parameter left there earlier
+        // (see `check_reflection::SXSS_BASELINE`). Captured after the Stage-0
+        // probe so that probe is not itself baseline-gated.
+        let sxss_baseline = if self.args.sxss {
+            Some(std::sync::Arc::new(
+                crate::scanning::check_reflection::capture_sxss_baseline(
+                    self.client.as_ref(),
+                    &self.target,
+                    &param,
+                    &self.args,
+                )
+                .await,
+            ))
+        } else {
+            None
+        };
+
+        let phases = async {
+            // Stored-XSS store-probe (baseline-gated). Stage 0 above is
+            // deliberately *not* baseline-gated, so a sibling field that never
+            // stores still passes it on the marker the storing field left on the
+            // retrieval page during analysis — and then runs the whole payload
+            // catalog, every payload correctly refused but each refusal paying
+            // the full retrieval retry/backoff loop (measured at tens of
+            // thousands of requests for one non-storing field). Re-probe the
+            // marker now, inside the baseline scope: the credit gate returns a
+            // hit only when *this* field's own injection raised the marker's
+            // occurrence above the pre-injection baseline, i.e. this field
+            // actually stores. If it does not, skip the catalog entirely.
+            // `--deep-scan` keeps the catalog (it must not depend on this gate).
+            // Non-`--sxss` scans keep the per-payload retries; `--sxss` decides
+            // below from the store-probe (a synchronous sink skips them, a
+            // write-behind sink keeps them).
+            let mut sxss_skip_payload_retries = false;
+            if self.args.sxss && !self.args.deep_scan {
+                let outcome = check_reflection::sxss_store_probe(
+                    self.client.as_ref(),
+                    &self.target,
+                    &param,
+                    &self.args,
+                )
+                .await;
+                if !outcome.stored {
+                    crate::dbg_log!(
+                        "sxss store-probe (param={}): injection did not raise the marker count above the baseline — field does not store here, skipping the payload catalog",
+                        param.name
+                    );
+                    self.flush_results(&mut state.local_results).await;
+                    return;
+                }
+                // Only skip the per-payload retrieval retries when the store was
+                // visible on the first pass. A write-behind sink (store visible
+                // only after a wait) keeps the full retries so a delayed payload
+                // is not missed.
+                sxss_skip_payload_retries = outcome.synchronous;
+                if !sxss_skip_payload_retries {
+                    crate::dbg_log!(
+                        "sxss store-probe (param={}): store is write-behind — keeping per-payload retrieval retries",
+                        param.name
+                    );
+                }
+            }
+
+            // Save a reference copy for the HPP phase (only first 5 payloads)
+            // before the reflection phase consumes `reflection_payloads`. Gate on
+            // the same condition `run_hpp_phase` checks (Query location) so we don't
+            // clone payloads for params whose HPP phase would immediately return.
+            let hpp_payloads: Vec<String> =
+                if self.args.hpp && param.location == crate::parameter_analysis::Location::Query {
+                    reflection_payloads.iter().take(5).cloned().collect()
+                } else {
+                    vec![]
+                };
+
+            let payload_phases = async {
+                if let PhaseFlow::Abort = self
+                    .run_reflection_phase(&param, reflection_payloads, &mut state, &waf_streak)
+                    .await
+                {
+                    self.flush_results(&mut state.local_results).await;
+                    return;
+                }
+                if let PhaseFlow::Abort = self.run_dom_phase(&param, dom_payloads, &mut state).await
+                {
+                    self.flush_results(&mut state.local_results).await;
+                    return;
+                }
+                self.run_hpp_phase(&param, hpp_payloads, &mut state).await;
+
+                self.flush_results(&mut state.local_results).await;
             };
 
-        if let PhaseFlow::Abort = self
-            .run_reflection_phase(&param, reflection_payloads, &mut state, &waf_streak)
-            .await
-        {
-            self.flush_results(&mut state.local_results).await;
-            return;
-        }
-        if let PhaseFlow::Abort = self.run_dom_phase(&param, dom_payloads, &mut state).await {
-            self.flush_results(&mut state.local_results).await;
-            return;
-        }
-        self.run_hpp_phase(&param, hpp_payloads, &mut state).await;
+            // Under `--sxss` with a *synchronous* sink, disable the per-payload
+            // retrieval retries for the payload phases only (the store-probe
+            // above kept them): the store-probe confirmed the sink stores on the
+            // first pass, so a non-stored payload no longer pays the backoff
+            // loop. A write-behind sink keeps the retries. See
+            // `check_reflection::SXSS_SKIP_PAYLOAD_RETRIES`.
+            if sxss_skip_payload_retries {
+                crate::scanning::check_reflection::SXSS_SKIP_PAYLOAD_RETRIES
+                    .scope(true, payload_phases)
+                    .await;
+            } else {
+                payload_phases.await;
+            }
+        };
 
-        self.flush_results(&mut state.local_results).await;
+        // The baseline is a task-local, and task-locals do not cross
+        // `tokio::spawn`. Everything that consults the credit gate
+        // (`check_reflection::sxss_injection_credited`) must run inside this
+        // scope on the same task: the gate fails *open* when the baseline is
+        // missing, so a spawn inside the reflection/DOM phases would silently
+        // bring back the wrong-field stored-XSS finding. Guarded by
+        // `sxss_credit_gate_always_sees_a_baseline_during_the_phases`.
+        match sxss_baseline {
+            Some(baseline) => {
+                crate::scanning::check_reflection::SXSS_BASELINE
+                    .scope(baseline, phases)
+                    .await
+            }
+            None => phases.await,
+        }
     }
 
     /// Stage 0 fast probe: detect whether the param reflects at all before
@@ -739,25 +839,35 @@ impl ScanWorkerCtx {
         let probe_payloads: [&str; 1] = [crate::scanning::markers::bracketed_marker()];
         let mut probe_reflected = false;
         let mut probe_response_text: Option<String> = None;
+        let mut probe_response_is_javascript = false;
+        let mut probe_response_is_xml = false;
         for pp in probe_payloads {
             if self.cancelled() {
                 break;
             }
-            let (kind, response_text) = check_reflection_with_response_tracked(
-                Some(client),
-                &self.target,
-                param,
-                pp,
-                &self.args,
-                waf_streak,
-            )
-            .await;
+            let (kind, response_text, _, xml_content_type) =
+                check_reflection::check_reflection_with_response_status(
+                    Some(client),
+                    &self.target,
+                    param,
+                    pp,
+                    &self.args,
+                    waf_streak,
+                )
+                .await;
             // Only a browser-rendered body may seed AST analysis / probe
             // classification; the 3xx `Location:` stand-in is not a document.
-            let response_text = response_text.and_then(|b| b.renderable.then_some(b.text));
+            let (response_text, is_javascript, is_xml) = match response_text {
+                Some(body) if body.renderable => {
+                    (Some(body.text), body.js_content_type, xml_content_type)
+                }
+                _ => (None, false, false),
+            };
             if kind.is_some() {
                 probe_reflected = true;
                 probe_response_text = response_text;
+                probe_response_is_javascript = is_javascript;
+                probe_response_is_xml = is_xml;
                 break;
             } else if let Some(ref text) = response_text {
                 // Even if safe-context suppressed the reflection kind,
@@ -767,10 +877,14 @@ impl ScanWorkerCtx {
                 if crate::scanning::markers::classify_probe_reflection(text).detected() {
                     probe_reflected = true;
                     probe_response_text = response_text;
+                    probe_response_is_javascript = is_javascript;
+                    probe_response_is_xml = is_xml;
                     break;
                 }
                 // Keep one response for AST analysis below.
                 probe_response_text = response_text;
+                probe_response_is_javascript = is_javascript;
+                probe_response_is_xml = is_xml;
             }
         }
 
@@ -779,18 +893,22 @@ impl ScanWorkerCtx {
             && let Some(ref response_text) = probe_response_text
         {
             state.ast_analysis_done = true;
-            let ast_findings = run_ast_dom_analysis(
-                client,
-                &self.target,
-                param,
-                response_text,
-                &mut state.ast_seen,
-            )
-            .await;
-            for f in &ast_findings {
-                self.stream_finding(f);
+            if !probe_response_is_javascript {
+                let ast_findings = run_ast_dom_analysis(
+                    client,
+                    &self.target,
+                    param,
+                    response_text,
+                    crate::scanning::markers::bracketed_marker(),
+                    probe_response_is_xml,
+                    &mut state.ast_seen,
+                )
+                .await;
+                for f in &ast_findings {
+                    self.stream_finding(f);
+                }
+                state.local_results.extend(ast_findings);
             }
-            state.local_results.extend(ast_findings);
         }
 
         // If probe found no reflection, try a numeric-only probe to detect
@@ -873,7 +991,7 @@ impl ScanWorkerCtx {
                     .map(|p| self.fetch_reflection(param, p, waf_streak)),
             )
             .await;
-            for (reflection_payload, (reflected_kind, reflection_body, status)) in
+            for (reflection_payload, (reflected_kind, reflection_body, status, xml_content_type)) in
                 reflection_payloads[i..end].iter().zip(fetched)
             {
                 self.inc_progress(1);
@@ -891,9 +1009,17 @@ impl ScanWorkerCtx {
                 // mints no `R`. `reflected_kind.is_some()` responses are handled
                 // by that short-circuit and never reach the budget. The status
                 // rides alongside the body (not on the public `ReflectionBody`)
-                // via the crate-private status-aware fetch; `0` (request error /
-                // sxss) is treated as non-4xx.
+                // via the crate-private status-aware fetch; `0` (a request
+                // error) is treated as non-4xx.
+                //
+                // `--sxss` is excluded for the same reason the DOM phase's
+                // early exit is: verification fans out across secondary
+                // retrieval URLs, so the single injection status is `0` for
+                // every payload and an escaped echo on one retrieval page says
+                // nothing about the rest. Without this the budget it was meant
+                // to stay out of would retire a stored run after 256 payloads.
                 if !self.args.deep_scan
+                    && !self.args.sxss
                     && reflected_kind.is_none()
                     && !(400..500).contains(&status)
                     && reflection_body.as_ref().is_some_and(|b| {
@@ -908,6 +1034,7 @@ impl ScanWorkerCtx {
                     reflection_payload,
                     reflected_kind,
                     reflection_body,
+                    (status, xml_content_type),
                     state,
                 )
                 .await;
@@ -952,8 +1079,10 @@ impl ScanWorkerCtx {
         reflection_payload: &str,
         reflected_kind: Option<check_reflection::ReflectionKind>,
         reflection_body: Option<check_reflection::ReflectionBody>,
+        status_and_xml_content_type: (u16, bool),
         state: &mut ParamScanState,
     ) {
+        let (status, xml_content_type) = status_and_xml_content_type;
         {
             // Everything downstream of here infers execution from the body
             // (AST sinks, the static V upgrade), so it may only ever see a
@@ -970,24 +1099,43 @@ impl ScanWorkerCtx {
             // rendered element. Only JS-context evidence upgrades R→V there.
             let body_is_javascript = reflection_body.as_ref().is_some_and(|b| b.js_content_type);
 
-            // AST-based DOM XSS analysis (enabled by default unless skipped)
+            // AST-based DOM XSS analysis (enabled by default unless skipped).
+            //
+            // This is the once-per-parameter seed, and Stage 0 now hands it
+            // over whenever the pre-scan active probe already answered the
+            // reflection question (`param.marker_echoed`) — so the document it
+            // latches onto is the response to an *attack* payload, not to a
+            // benign marker. A 4xx/5xx interstitial is renderable HTML and
+            // passes every other gate (`injection_response_suppressed` filters
+            // content-types and `--ignore-return`, not block statuses), so on a
+            // WAF'd endpoint the first 403 block page would consume the seed
+            // and the application's own document would never be analysed for
+            // that parameter. Only seed from a status that could be the
+            // application answering: 2xx/3xx, or `0` (request error / `--sxss`
+            // retrieval, which is the real page).
+            let status_can_seed_ast = status < 400;
             if !self.args.skip_ast_analysis
                 && !state.ast_analysis_done
+                && status_can_seed_ast
                 && let Some(response_text) = renderable_text
             {
                 state.ast_analysis_done = true;
-                let ast_findings = run_ast_dom_analysis(
-                    self.client.as_ref(),
-                    &self.target,
-                    param,
-                    response_text,
-                    &mut state.ast_seen,
-                )
-                .await;
-                for f in &ast_findings {
-                    self.stream_finding(f);
+                if !body_is_javascript {
+                    let ast_findings = run_ast_dom_analysis(
+                        self.client.as_ref(),
+                        &self.target,
+                        param,
+                        response_text,
+                        reflection_payload,
+                        xml_content_type,
+                        &mut state.ast_seen,
+                    )
+                    .await;
+                    for f in &ast_findings {
+                        self.stream_finding(f);
+                    }
+                    state.local_results.extend(ast_findings);
                 }
-                state.local_results.extend(ast_findings);
             }
 
             if let Some(kind) = reflected_kind {
@@ -1007,12 +1155,13 @@ impl ScanWorkerCtx {
                 // can prove that genuine V.
                 let dom_evidence_kind = renderable_text
                     .and_then(|body| {
-                        crate::scanning::check_dom_verification::classify_dom_evidence(
+                        crate::scanning::check_dom_verification::classify_dom_evidence_for_reflection_body(
                             reflection_payload,
                             body,
+                            body_is_javascript,
+                            xml_content_type,
                         )
-                    })
-                    .filter(|kind| !(body_is_javascript && kind.requires_html_rendering()));
+                    });
 
                 // An inert HTML echo into a JS body is not a finding. Lock the
                 // param's reflection slot (so the reflection phase stops here
@@ -1161,7 +1310,9 @@ impl ScanWorkerCtx {
                         .message_id(606)
                         .message_str(poc_msg)
                         .build();
-                    result.location = format!("{:?}", param.location);
+                    result.set_injection_point(&self.target, param);
+                    result.wire_payload =
+                        (poc_payload != reflection_payload).then_some(poc_payload);
                     result.request =
                         Some(build_request_text(&self.target, param, reflection_payload));
                     // Report the observed text even when it isn't renderable:
@@ -1261,10 +1412,15 @@ impl ScanWorkerCtx {
                 if state.dom_found_locally {
                     continue;
                 }
+                let crate::scanning::check_dom_verification::DomVerifyEvidenceOutcome {
+                    outcome,
+                    evidence_kind,
+                } = outcome;
                 let crate::scanning::check_dom_verification::DomVerifyOutcome {
                     verified: dom_verified,
                     response_text,
                     reflected,
+                    live_reflection,
                     status,
                 } = outcome;
                 if dom_verified {
@@ -1302,15 +1458,8 @@ impl ScanWorkerCtx {
 
                         // Determine which evidence path proved exploitability
                         // so the V finding's message reflects the route.
-                        let evidence_label = response_text
-                            .as_deref()
-                            .and_then(|body| {
-                                crate::scanning::check_dom_verification::classify_dom_evidence(
-                                    dom_payload,
-                                    body,
-                                )
-                            })
-                            .map_or("DOM evidence", |k| k.label());
+                        let evidence_label =
+                            evidence_kind.map_or("DOM evidence", |kind| kind.label());
 
                         // DOM-verified => Vulnerability
                         let mut result =
@@ -1346,7 +1495,8 @@ impl ScanWorkerCtx {
                                     evidence_label, param.name, dom_payload
                                 ))
                                 .build();
-                        result.location = format!("{:?}", param.location);
+                        result.set_injection_point(&self.target, param);
+                        result.wire_payload = (poc_payload != *dom_payload).then_some(poc_payload);
                         result.request = Some(build_request_text(&self.target, param, dom_payload));
                         result.response = response_text
                             .map(|t| crate::scanning::result::bound_evidence_body(t, dom_payload));
@@ -1370,7 +1520,10 @@ impl ScanWorkerCtx {
                 // first, `should_add == false`) must not be miscounted.
                 if !dom_verified {
                     inert_echo_count = next_inert_echo_count(inert_echo_count, reflected);
-                    blocked_streak = next_blocked_streak(blocked_streak, status, reflected);
+                    // The strict, byte-exact signal — not the widened
+                    // `reflected` that also counts escaped echoes. See
+                    // `DomVerifyOutcome::live_reflection`.
+                    blocked_streak = next_blocked_streak(blocked_streak, status, live_reflection);
                     redirect_streak = next_redirect_streak(redirect_streak, status);
                 }
                 if early_exit.is_none()
@@ -1420,8 +1573,20 @@ impl ScanWorkerCtx {
         // `hpp_payloads` is already the small reflection-payload subset capped
         // by the caller (see `scan_param`), which bounds the request fan-out.
         let hpp_positions = [HppPosition::Last, HppPosition::First, HppPosition::Both];
+        // Same base the reflection/DOM phases inject at: a query param found in
+        // a `<form action=…>` lives at the action URL, not at the page that
+        // hosts the form. Polluting `target.url` sent every HPP request to the
+        // form page, where the parameter is never read.
+        let hpp_base = crate::scanning::url_inject::effective_query_base(&self.target.url, param);
 
         'hpp_outer: for hpp_payload in &hpp_payloads {
+            // Send the as-encoded value like every other phase does (base64,
+            // multi-URL, …), but classify the reflection against the raw
+            // payload, which is what the server renders after decoding. The
+            // raw payload on the wire decoded to garbage on a pre-encoded param,
+            // so the HPP phase could never find anything there.
+            let wire_payload =
+                crate::encoding::pre_encoding::apply_param_encoding(hpp_payload, param);
             // Cancellation is checked here *and* in the inner position loop:
             // this phase runs after the reflection/DOM phases have already
             // broken out on cancel, and without its own check a cancelled
@@ -1434,8 +1599,7 @@ impl ScanWorkerCtx {
                 if self.cancelled() {
                     break 'hpp_outer;
                 }
-                if let Some(hpp_url) = build_hpp_url(&self.target.url, param, hpp_payload, position)
-                {
+                if let Some(hpp_url) = build_hpp_url(&hpp_base, param, &wire_payload, position) {
                     let (kind, response_text) =
                         crate::scanning::check_reflection::check_reflection_with_hpp_url(
                             self.client.as_ref(),
@@ -1485,7 +1649,9 @@ impl ScanWorkerCtx {
                                     reflection_note, param.name, hpp_payload, pos_label
                                 ))
                                 .build();
-                        result.location = format!("{:?}", param.location);
+                        result.set_injection_point(&self.target, param);
+                        result.wire_payload =
+                            (wire_payload != *hpp_payload).then(|| wire_payload.clone());
                         result.response = response_text
                             .map(|t| crate::scanning::result::bound_evidence_body(t, hpp_payload));
                         self.stream_finding(&result);
@@ -1498,11 +1664,17 @@ impl ScanWorkerCtx {
     }
 }
 
+/// A parameter with this name makes its scan worker panic, so the callers'
+/// handling of [`ScanRunReport::worker_panics`] can be driven end to end.
+#[cfg(test)]
+pub(crate) const TEST_WORKER_PANIC_PARAM: &str = "__dalfox_test_worker_panic__";
+
 /// Outcome of a `run_scanning` call. The REST server and MCP runners inspect
 /// `worker_panics` so a scan that lost workers to a panic can be surfaced as a
 /// partial/failed result instead of being silently reported `done` — a worker
 /// panic means the param's findings are incomplete, indistinguishable from
-/// "scanned, found nothing" otherwise. The CLI additionally uses
+/// "scanned, found nothing" otherwise. The CLI marks such a target failed
+/// (`INTERNAL_ERROR`, state-file `error`) and additionally uses
 /// `limit_stopped` to decide a target's `--state-file` terminal state.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct ScanRunReport {
@@ -1750,6 +1922,10 @@ pub async fn run_scanning(
         // it sends are tallied and rate-limited against THIS job, not the
         // process-wide globals (see `JobScopes`). Cheap no-op on the CLI.
         handles.spawn(crate::with_job_scopes(job_scopes.clone(), async move {
+            #[cfg(test)]
+            if param_clone.name == TEST_WORKER_PANIC_PARAM {
+                panic!("test-injected scan worker panic");
+            }
             ctx.scan_param(param_clone, reflection_payloads, dom_payloads)
                 .await;
             // Bump the live completion counter after this parameter is fully

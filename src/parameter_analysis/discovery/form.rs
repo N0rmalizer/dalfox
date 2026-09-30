@@ -1,12 +1,35 @@
 //! Discovery surface: form. See the module docs in `mod.rs`.
 
 use super::*;
+use std::collections::HashSet;
 
 /// Discover POST form parameters by parsing HTML forms from the GET response.
+#[cfg(test)]
 pub async fn check_form_discovery(
     target: &Target,
     reflection_params: Arc<Mutex<Vec<Param>>>,
     semaphore: Arc<Semaphore>,
+) {
+    check_form_discovery_with(target, reflection_params, semaphore, false).await;
+}
+
+/// [`check_form_discovery`], optionally keeping form fields whose submission
+/// did not echo the probe marker.
+///
+/// `keep_unreflected` is set under `--sxss`. Every probe here keeps a field only
+/// when the marker comes back in the *immediate* response, which a stored sink
+/// by definition fails: a comment form's write endpoint answers "saved" and
+/// the value surfaces later, on the page that lists comments. Dropping those
+/// fields left the scan with nothing to test, so `--sxss` against the canonical
+/// form-backed stored sink reported clean without ever requesting the
+/// retrieval URL. Kept fields carry `form_action_url` / `form_origin_url`, which
+/// is what the stored-XSS stages resolve their check URLs from, and the
+/// Stage-0 probe still drops any field whose value is never stored.
+pub(crate) async fn check_form_discovery_with(
+    target: &Target,
+    reflection_params: Arc<Mutex<Vec<Param>>>,
+    semaphore: Arc<Semaphore>,
+    keep_unreflected: bool,
 ) {
     // Only discover forms when the target doesn't already have POST data
     if target.data.is_some() || target.method.eq_ignore_ascii_case("POST") {
@@ -58,12 +81,13 @@ pub async fn check_form_discovery(
             let enctype = form.value().attr("enctype").unwrap_or("");
             let is_multipart = enctype.eq_ignore_ascii_case("multipart/form-data");
 
+            // Only probe forms whose action the scan is allowed to send the
+            // operator's credentials to; see the resolver for what that means
+            // and why the action attribute cannot be trusted.
             let action = form.value().attr("action").unwrap_or("");
-            let form_url = if action.is_empty() || action == "#" {
-                target.url.clone()
-            } else if let Ok(resolved) = target.url.join(action) {
-                resolved
-            } else {
+            let Some(form_url) =
+                crate::utils::http::resolve_probeable_form_action(&target.url, action)
+            else {
                 continue;
             };
 
@@ -145,22 +169,22 @@ pub async fn check_form_discovery(
                 )
                 .multipart(form);
                 crate::record_outbound_request().await;
-                if let Ok(resp) = crate::utils::http::send_counted(rb).await
-                    && let Ok(text) = crate::utils::http::read_body(resp).await
-                    && crate::scanning::markers::classify_probe_reflection(&text).detected()
+                if let Some(param) = form_field_param(
+                    crate::utils::http::send_counted(rb).await,
+                    keep_unreflected,
+                    Param {
+                        form_action_url: Some(form_url.to_string()),
+                        form_origin_url: Some(target.url.to_string()),
+                        ..Param::new(
+                            field_name.clone(),
+                            field_value.clone(),
+                            crate::parameter_analysis::Location::MultipartBody,
+                        )
+                    },
+                )
+                .await
                 {
-                    batch.push(
-                        Param {
-                            form_action_url: Some(form_url.to_string()),
-                            form_origin_url: Some(target.url.to_string()),
-                            ..Param::new(
-                                field_name.clone(),
-                                field_value.clone(),
-                                crate::parameter_analysis::Location::MultipartBody,
-                            )
-                        }
-                        .with_reflection_analysis(&text),
-                    );
+                    batch.push(param);
                 }
                 if target.delay > 0 {
                     sleep(Duration::from_millis(target.delay)).await;
@@ -219,63 +243,92 @@ pub async fn check_form_discovery(
                     )],
                 );
                 crate::record_outbound_request().await;
-                if let Ok(resp) = crate::utils::http::send_counted(rb).await
-                    && let Ok(text) = crate::utils::http::read_body(resp).await
-                    && crate::scanning::markers::classify_probe_reflection(&text).detected()
+                if let Some(param) = form_field_param(
+                    crate::utils::http::send_counted(rb).await,
+                    keep_unreflected,
+                    Param {
+                        form_action_url: Some(form_url.to_string()),
+                        form_origin_url: Some(target.url.to_string()),
+                        ..Param::new(
+                            field_name.clone(),
+                            field_value.clone(),
+                            crate::parameter_analysis::Location::Body,
+                        )
+                    },
+                )
+                .await
                 {
-                    batch.push(
-                        Param {
-                            form_action_url: Some(form_url.to_string()),
-                            form_origin_url: Some(target.url.to_string()),
-                            ..Param::new(
-                                field_name.clone(),
-                                field_value.clone(),
-                                crate::parameter_analysis::Location::Body,
-                            )
-                        }
-                        .with_reflection_analysis(&text),
-                    );
+                    batch.push(param);
                 }
                 if target.delay > 0 {
                     sleep(Duration::from_millis(target.delay)).await;
                 }
             }
         } else {
-            // GET form: test each field as query parameter on the form action URL
-            for (field_name, field_value) in &fields {
+            // GET form: test each field as query parameter on the form action URL.
+            // Capped like the POST and multipart branches above: this loop was
+            // the one that was not, so a page serving a GET form with 50 000
+            // inputs bought 50 000 requests (each rebuilding the whole query
+            // string) while the debug log above still claimed only the first
+            // `MAX_FORM_FIELDS` were probed.
+            for (field_name, field_value) in fields.iter().take(MAX_FORM_FIELDS) {
                 let _permit = semaphore.acquire().await.expect("acquire semaphore permit");
                 let mut test_url = form_url.clone();
                 // Build query: set all fields, replace target field with test value
                 {
-                    let mut pairs = test_url.query_pairs_mut();
-                    pairs.clear();
+                    let mut pairs: Vec<(String, String)> = test_url
+                        .query_pairs()
+                        .map(|(name, value)| (name.into_owned(), value.into_owned()))
+                        .collect();
+                    let action_names: HashSet<String> =
+                        pairs.iter().map(|(name, _)| name.clone()).collect();
                     for (n, v) in &fields {
-                        if n == field_name {
-                            pairs.append_pair(n, test_value);
+                        let value = if n == field_name {
+                            test_value.to_string()
                         } else {
-                            pairs.append_pair(n, v);
+                            v.clone()
+                        };
+                        if action_names.contains(n) {
+                            // Like the scan sender, replace every existing
+                            // occurrence of a tested key so an earlier page
+                            // query value cannot hide the probe from
+                            // first-value servers.
+                            for (action_name, action_value) in &mut pairs {
+                                if action_name == n {
+                                    *action_value = value.clone();
+                                }
+                            }
+                        } else {
+                            pairs.push((n.clone(), value));
                         }
                     }
+                    // A browser GET form replaces the action URL's query.
+                    // Dalfox crafts this probe URL directly: retain unrelated
+                    // static action params such as `mode=search`, replacing
+                    // colliding keys and appending only new field names.
+                    let mut query = test_url.query_pairs_mut();
+                    query.clear();
+                    query.extend_pairs(&pairs);
                 }
                 let m = reqwest::Method::GET;
                 let rb = crate::utils::build_request(&client, target, m, test_url.clone(), None);
                 crate::record_outbound_request().await;
-                if let Ok(resp) = crate::utils::http::send_counted(rb).await
-                    && let Ok(text) = crate::utils::http::read_body(resp).await
-                    && crate::scanning::markers::classify_probe_reflection(&text).detected()
+                if let Some(param) = form_field_param(
+                    crate::utils::http::send_counted(rb).await,
+                    keep_unreflected,
+                    Param {
+                        form_action_url: Some(form_url.to_string()),
+                        form_origin_url: Some(target.url.to_string()),
+                        ..Param::new(
+                            field_name.clone(),
+                            field_value.clone(),
+                            crate::parameter_analysis::Location::Query,
+                        )
+                    },
+                )
+                .await
                 {
-                    batch.push(
-                        Param {
-                            form_action_url: Some(form_url.to_string()),
-                            form_origin_url: Some(target.url.to_string()),
-                            ..Param::new(
-                                field_name.clone(),
-                                field_value.clone(),
-                                crate::parameter_analysis::Location::Query,
-                            )
-                        }
-                        .with_reflection_analysis(&text),
-                    );
+                    batch.push(param);
                 }
                 if target.delay > 0 {
                     sleep(Duration::from_millis(target.delay)).await;
@@ -486,5 +539,23 @@ pub async fn check_form_discovery(
     if !batch.is_empty() {
         let mut guard = reflection_params.lock().await;
         guard.extend(batch);
+    }
+}
+
+/// Turn one form-field probe response into a discovered param: kept with its
+/// reflection analysis when the marker echoed, kept bare when it did not but
+/// `keep_unreflected` asks for it (`--sxss`, see [`check_form_discovery_with`]),
+/// dropped otherwise. A probe that never got a response keeps nothing either
+/// way — an unreachable form is not evidence of a stored sink.
+async fn form_field_param(
+    sent: Result<reqwest::Response, reqwest::Error>,
+    keep_unreflected: bool,
+    param: Param,
+) -> Option<Param> {
+    let text = crate::utils::http::read_body(sent.ok()?).await.ok()?;
+    if crate::scanning::markers::classify_probe_reflection(&text).detected() {
+        Some(param.with_reflection_analysis(&text))
+    } else {
+        keep_unreflected.then_some(param)
     }
 }

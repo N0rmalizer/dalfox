@@ -192,6 +192,26 @@ pub struct Param {
     /// starts out `false`, i.e. gets the pre-existing behaviour.
     #[serde(default, skip)]
     pub marker_echoed: bool,
+    /// Page slots (element attributes / text, CSS custom properties) that
+    /// held the pre-scan probe's marker, when that probe echoed on a page with
+    /// script. The AST phase reads it as proof that the page's JS reading
+    /// those slots reads this parameter: Stage 0 is skipped when the probe
+    /// echoed, and the attack response it analyses instead has usually broken
+    /// out of the very slot it would need to prove. Scan-internal, like
+    /// `marker_echoed`.
+    #[serde(default, skip)]
+    pub reflected_markup: Option<std::sync::Arc<crate::scanning::ast_dom_analysis::PageMarkup>>,
+    /// XML response MIME for which the active probe reflected its marker but
+    /// the body has no active namespace yet. The scan uses a small, namespaced
+    /// XML payload set for this case rather than spending the full HTML catalog
+    /// on a document that currently parses as inert XML.
+    #[serde(default, skip)]
+    pub xml_namespace_candidate: Option<String>,
+    /// Explicitly distinguishes a cookie parameter from an HTTP header when
+    /// both locations carry the same name. `None` preserves the legacy
+    /// target-based inference for params created by older callers.
+    #[serde(skip)]
+    pub is_cookie: Option<bool>,
 }
 
 impl Param {
@@ -228,7 +248,17 @@ impl Param {
             escaped_specials: None,
             js_breakout: None,
             marker_echoed: false,
+            reflected_markup: None,
+            xml_namespace_candidate: None,
+            is_cookie: None,
         }
+    }
+
+    /// Set the wire location for a `Header` param when discovery already knows
+    /// whether it came from the Cookie header or a named request header.
+    pub(crate) fn with_cookie_identity(mut self, is_cookie: bool) -> Self {
+        self.is_cookie = Some(is_cookie);
+        self
     }
 
     /// Fill in the analysis fields every reflection probe derives from the
@@ -316,12 +346,30 @@ pub(crate) struct ReflectionAnalysis {
 impl ReflectionAnalysis {
     /// Analyze a response body that already contains the reflection marker.
     pub(crate) fn of(body: &str) -> Self {
+        let inner = crate::scanning::markers::inner_marker();
+        let marker = if body.contains(inner) {
+            inner
+        } else {
+            crate::scanning::markers::open_marker()
+        };
+        Self::of_with_marker(body, marker)
+    }
+
+    /// Analyze a response body relative to a specific marker occurrence.
+    ///
+    /// Batched query mining can receive several reflected canaries in one
+    /// response. The shared analysis shape is still useful for the special
+    /// character split, but the injection context and JS breakout must follow
+    /// the canary being turned into a `Param`; otherwise a script reflection
+    /// can incorrectly lend its context to a text or attribute reflection in
+    /// the same response.
+    pub(crate) fn of_with_marker(body: &str, marker: &str) -> Self {
         let (valid_specials, invalid_specials) = classify_special_chars(body);
         Self {
-            injection_context: detect_injection_context(body),
+            injection_context: detect_injection_context_with_marker(body, marker),
             valid_specials,
             invalid_specials,
-            js_breakout: detect_js_breakout(body),
+            js_breakout: detect_js_breakout_with_marker(body, marker),
         }
     }
 }
@@ -453,6 +501,12 @@ pub(crate) struct ProbeResponse {
     /// scan worker's Stage-0 probe applies to its own response — so a marker
     /// echoed in a JSON API body is *not* evidence Stage 0 can be skipped on.
     actionable: bool,
+    /// True when an XML response reflected the probe markers but its document
+    /// did not yet have an active XHTML/SVG namespace. Such a response needs
+    /// the small XML namespace-activation payload family.
+    xml_candidate_response: bool,
+    content_type: String,
+    markup_document: bool,
 }
 
 async fn send_probe_request_detailed(
@@ -482,6 +536,9 @@ async fn send_probe_request_detailed(
     let unusable = ProbeResponse {
         text: None,
         actionable: false,
+        xml_candidate_response: false,
+        content_type: String::new(),
+        markup_document: false,
     };
     let Ok(resp) = crate::utils::http::send_counted(request_builder).await else {
         return unusable;
@@ -496,12 +553,6 @@ async fn send_probe_request_detailed(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_string();
-    // Path has extra body-dependent suppressions (error pages echo the URL, a
-    // marker outside markup) that this cheap check cannot replicate, so a path
-    // param is never counted as actionable — Stage 0 keeps judging those.
-    let actionable = !matches!(param.location, Location::Path)
-        && !(300..400).contains(&status_code)
-        && !crate::utils::http::content_type_is_never_markup(&content_type);
     let redirect_text = if resp.status().is_redirection() {
         resp.headers()
             .get(reqwest::header::LOCATION)
@@ -517,6 +568,22 @@ async fn send_probe_request_detailed(
             None
         }
     };
+    let markup_document = crate::utils::is_javascript_content_type(&content_type)
+        || body_text
+            .as_deref()
+            .is_some_and(|body| crate::utils::response_has_markup_document(&content_type, body));
+    // Path has extra body-dependent suppressions (error pages echo the URL, a
+    // marker outside markup) that this check cannot replicate, so a path param
+    // is never counted as actionable — Stage 0 keeps judging those. The body
+    // check also distinguishes inactive XML documents from XML that already
+    // carries an executable XHTML/SVG namespace.
+    let actionable = !matches!(param.location, Location::Path)
+        && !(300..400).contains(&status_code)
+        && !crate::utils::http::content_type_is_never_markup(&content_type)
+        && markup_document;
+    let xml_candidate_response = !matches!(param.location, Location::Path)
+        && !(300..400).contains(&status_code)
+        && crate::utils::is_xml_content_type(&content_type);
     ProbeResponse {
         text: Some(match (redirect_text, body_text) {
             (Some(loc), Some(body)) => format!("{}{}", loc, body),
@@ -525,6 +592,9 @@ async fn send_probe_request_detailed(
             (None, None) => String::new(),
         }),
         actionable,
+        xml_candidate_response,
+        content_type,
+        markup_document,
     }
 }
 
@@ -817,6 +887,22 @@ pub async fn active_probe_param(
     // act on.
     param.marker_echoed =
         batched.actionable && batched.text.as_deref().is_some_and(body_has_probe_marker);
+    if param.marker_echoed {
+        param.reflected_markup = batched
+            .text
+            .as_deref()
+            .and_then(crate::scanning::ast_integration::reflected_markup_from_html)
+            .map(std::sync::Arc::new);
+    }
+    let xml_text_context = matches!(
+        param.injection_context.as_ref(),
+        None | Some(InjectionContext::Html(None))
+    );
+    param.xml_namespace_candidate = (xml_text_context
+        && batched.xml_candidate_response
+        && !batched.markup_document
+        && batched.text.as_deref().is_some_and(body_has_probe_marker))
+    .then_some(batched.content_type);
     let batched_response = batched.text;
 
     let mut valid: Vec<char> = Vec::new();
@@ -1115,6 +1201,16 @@ pub async fn analyze_parameters(
     args: &ScanArgs,
     multi_pb: Option<Arc<MultiProgress>>,
 ) {
+    // CLI `-d` bodies are present on both `ScanArgs` and `Target`, but imported
+    // raw-HTTP/HAR requests carry their body only on `Target`. The body mining
+    // strategies consume `ScanArgs.data`, so give them the captured body when
+    // there was no explicit CLI body override.
+    let mut effective_args = args.clone();
+    if effective_args.data.is_none() {
+        effective_args.data.clone_from(&target.data);
+    }
+    let args = &effective_args;
+
     let pb = if let Some(ref mp) = multi_pb {
         let bar = mp.add(ProgressBar::new_spinner());
         // The message changes as mining moves between sources, and indicatif
@@ -1222,6 +1318,21 @@ pub async fn analyze_parameters(
             probed.push(res);
         }
     }
+    if args.sxss {
+        // The active probe judges special characters from the *write*
+        // response. A stored sink that does not render the value there (the
+        // common "saved" / redirect / JSON-ack shape) comes back with no marker
+        // at all, which the probe records as "every special is filtered" — and
+        // the adaptive prune then drops every `<`/`>`/quote payload before the
+        // retrieval URL is ever checked. That verdict describes a page that
+        // never showed the value, not the one that renders it, so discard it
+        // and let the full payload set run (the same `None` the multi-URL-decode
+        // detection above uses for "the filter verdict does not apply").
+        for p in probed.iter_mut().filter(|p| !p.marker_echoed) {
+            p.valid_specials = None;
+            p.invalid_specials = None;
+        }
+    }
     target.reflection_params = probed;
 
     // Logging parameter analysis (stderr). When an indicatif spinner is active,
@@ -1262,9 +1373,10 @@ pub async fn analyze_parameters(
 }
 
 /// The `-p name:<type>` label for a param's location, matching the `-p`
-/// spec grammar. `Location::Header` resolves to `"cookie"` when the name is one
-/// of the target's cookies, else `"header"`. Single source of truth shared by
-/// `filter_params` and `ensure_explicit_params`.
+/// spec grammar. `Location::Header` uses explicit discovery identity when
+/// available and falls back to target-cookie membership for synthesized
+/// legacy params. Single source of truth shared by `filter_params` and
+/// `ensure_explicit_params`.
 fn param_type_label(p: &Param, target: &Target) -> &'static str {
     match p.location {
         Location::Query => "query",
@@ -1276,7 +1388,9 @@ fn param_type_label(p: &Param, target: &Target) -> &'static str {
         Location::Path => "path",
         Location::Fragment => "fragment",
         Location::Header => {
-            if target.cookies.iter().any(|(n, _)| n == &p.name) {
+            if p.is_cookie
+                .unwrap_or_else(|| target.cookies.iter().any(|(n, _)| n == &p.name))
+            {
                 "cookie"
             } else {
                 "header"
@@ -1358,14 +1472,19 @@ fn ensure_explicit_params(params: &mut Vec<Param>, param_specs: &[String], targe
             if already {
                 continue;
             }
-            push_synthesized_param(params, name, location);
+            let is_cookie = matches!(type_str, "cookie")
+                .then_some(true)
+                .or_else(|| (type_str == "header").then_some(false));
+            push_synthesized_param(params, name, location, is_cookie);
         } else {
             // Bare name: keep any filtered matches; only synthesize when none.
             if params.iter().any(|p| p.name == name) {
                 continue;
             }
             let location = infer_location_for_bare_param(name, target);
-            push_synthesized_param(params, name, location);
+            let is_cookie = (location == Location::Header)
+                .then(|| target.cookies.iter().any(|(n, _)| n == name));
+            push_synthesized_param(params, name, location, is_cookie);
         }
     }
 }
@@ -1415,12 +1534,19 @@ fn ensure_sxss_candidate_params(params: &mut Vec<Param>, target: &Target, args: 
         {
             continue;
         }
-        push_synthesized_param(params, &name, location);
+        push_synthesized_param(params, &name, location, None);
     }
 }
 
-fn push_synthesized_param(params: &mut Vec<Param>, name: &str, location: Location) {
-    params.push(Param::new(name.to_string(), String::new(), location));
+fn push_synthesized_param(
+    params: &mut Vec<Param>,
+    name: &str,
+    location: Location,
+    is_cookie: Option<bool>,
+) {
+    let mut param = Param::new(name.to_string(), String::new(), location);
+    param.is_cookie = is_cookie;
+    params.push(param);
 }
 
 /// Infer a wire location for a bare `-p name` when discovery did not seed it.

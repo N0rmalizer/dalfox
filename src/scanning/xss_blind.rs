@@ -134,26 +134,26 @@ fn build_blind_templates(custom_template_path: Option<&str>) -> Vec<String> {
                     } else {
                         bad_lines += 1;
                         if bad_lines <= 3 {
-                            eprintln!(
+                            crate::utils::log::eprintln_once(format!(
                                 "Warning: --custom-blind-xss-payload line {} skipped (no {{callback}} placeholder)",
                                 lineno + 1
-                            );
+                            ));
                         }
                     }
                 }
                 if !templates.is_empty() {
                     return templates;
                 }
-                eprintln!(
+                crate::utils::log::eprintln_once(format!(
                     "Warning: --custom-blind-xss-payload {} had no usable lines — falling back to built-in",
                     path
-                );
+                ));
             }
             Err(e) => {
-                eprintln!(
+                crate::utils::log::eprintln_once(format!(
                     "Warning: failed to read --custom-blind-xss-payload {}: {} — falling back to built-in",
                     path, e
-                );
+                ));
             }
         }
     }
@@ -171,21 +171,6 @@ fn build_blind_templates(custom_template_path: Option<&str>) -> Vec<String> {
         return vec![FALLBACK_TEMPLATE.to_string()];
     }
     templates
-}
-
-/// Backward-compatible entry: inject a blind payload built from a single static
-/// callback URL (`-b/--blind`). Thin shim over [`blind_scanning_with`].
-pub async fn blind_scanning(
-    target: &Target,
-    callback_url: &str,
-    custom_template_path: Option<&str>,
-) {
-    blind_scanning_with(
-        target,
-        CallbackSource::Static(callback_url),
-        custom_template_path,
-    )
-    .await;
 }
 
 /// Inject blind payloads into every query/body/header/cookie param. For an OOB
@@ -371,27 +356,12 @@ async fn send_blind_request(target: &Target, param_name: &str, payload: &str, pa
 /// and similar state survive the injection.
 ///
 /// GET forms are skipped because their fields overlap with the existing
-/// query-param blind injection in [`blind_scanning`]. Cross-origin form
+/// query-param blind injection in [`blind_scanning_with`]. Cross-origin form
 /// actions are skipped to avoid unintended outbound requests. Multipart
 /// forms are also skipped in this first pass.
-/// Backward-compatible entry: blind-scan forms with a single static callback
-/// URL (`-b/--blind`). Thin shim over [`blind_scan_forms_with`].
-pub async fn blind_scan_forms(
-    target: &Target,
-    callback_url: &str,
-    custom_template_path: Option<&str>,
-) {
-    blind_scan_forms_with(
-        target,
-        CallbackSource::Static(callback_url),
-        custom_template_path,
-    )
-    .await;
-}
-
-/// Discover same-origin POST forms and submit a blind payload per injectable
-/// field. For an OOB (or `Both`) source each field gets a fresh per-payload
-/// callback URL recorded for later correlation.
+///
+/// For an OOB (or `Both`) source each field gets a fresh per-payload callback
+/// URL recorded for later correlation.
 pub async fn blind_scan_forms_with(
     target: &Target,
     source: CallbackSource<'_>,
@@ -444,13 +414,24 @@ pub async fn blind_scan_forms_with(
         action: url::Url,
         fields: Vec<FormField>,
     }
+    // Bounds matching form discovery (`discovery/form.rs`): each injectable
+    // field is a POST whose body re-serializes every field, so one hostile
+    // page with 100 000 inputs (or forms) was that many multi-MB requests.
+    // Identical forms (same action and field names) are folded first.
+    const MAX_FORM_FIELDS: usize = 200;
+    const MAX_DISTINCT_FORMS: usize = 100;
     let forms: Vec<FormInfo> = {
         let document = crate::utils::html::parse_document_bounded(&html);
         let form_sel = crate::scanning::selectors::form();
         let input_sel = crate::scanning::selectors::input_textarea_select();
 
         let mut out = Vec::new();
+        let mut seen_forms: std::collections::HashSet<(String, Vec<String>)> =
+            std::collections::HashSet::new();
         for form in document.select(form_sel) {
+            if out.len() >= MAX_DISTINCT_FORMS {
+                break;
+            }
             let method = form.value().attr("method").unwrap_or("get");
             if !method.eq_ignore_ascii_case("post") {
                 continue;
@@ -484,6 +465,13 @@ pub async fn blind_scan_forms_with(
             if !fields.iter().any(|f| f.injectable) {
                 continue;
             }
+            let form_key = (
+                action_url.to_string(),
+                fields.iter().map(|f| f.name.clone()).collect(),
+            );
+            if !seen_forms.insert(form_key) {
+                continue;
+            }
 
             out.push(FormInfo {
                 action: action_url,
@@ -495,26 +483,40 @@ pub async fn blind_scan_forms_with(
 
     for FormInfo { action, fields } in forms {
         let action_str = action.as_str().to_string();
-        for field_idx in 0..fields.len() {
-            if !fields[field_idx].injectable {
-                continue;
-            }
+        // Encode the untouched fields once per form, not once per request.
+        let encoded: Vec<(String, String)> = fields
+            .iter()
+            .map(|f| {
+                (
+                    form_urlencoded::byte_serialize(f.name.as_bytes()).collect(),
+                    form_urlencoded::byte_serialize(f.value.as_bytes()).collect(),
+                )
+            })
+            .collect();
+        // Every field is still submitted; only the injected ones are capped.
+        let injectable_fields: Vec<usize> = (0..fields.len())
+            .filter(|&i| fields[i].injectable)
+            .take(MAX_FORM_FIELDS)
+            .collect();
+        for field_idx in injectable_fields {
             // One payload per callback channel (Static / Oob / Both). For OOB
             // this mints+records a fresh URL keyed to this form field.
             let field_name = &fields[field_idx].name;
             let payloads =
                 build_send_payloads(&source, template, &action_str, field_name, "Body", "POST");
             for payload in &payloads {
-                let body = fields
+                let encoded_payload: String =
+                    form_urlencoded::byte_serialize(payload.as_bytes()).collect();
+                let body = encoded
                     .iter()
                     .enumerate()
-                    .map(|(i, f)| {
-                        let value = if i == field_idx { payload } else { &f.value };
-                        let enc_n =
-                            form_urlencoded::byte_serialize(f.name.as_bytes()).collect::<String>();
-                        let enc_v =
-                            form_urlencoded::byte_serialize(value.as_bytes()).collect::<String>();
-                        format!("{}={}", enc_n, enc_v)
+                    .map(|(i, (enc_n, enc_v))| {
+                        let enc_v = if i == field_idx {
+                            &encoded_payload
+                        } else {
+                            enc_v
+                        };
+                        format!("{enc_n}={enc_v}")
                     })
                     .collect::<Vec<_>>()
                     .join("&");

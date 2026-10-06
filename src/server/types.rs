@@ -303,12 +303,14 @@ pub(crate) struct ScanOptions {
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub(crate) struct ResultPayload {
+pub(crate) struct ResultPayload<'a> {
     /// The original target URL submitted for scanning.
     pub(crate) target: String,
     pub(crate) status: JobStatus,
+    /// Borrowed from the job snapshot: polls used to deep-clone the whole
+    /// finding list just to serialize it once.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) results: Option<Vec<SanitizedResult>>,
+    pub(crate) results: Option<&'a [SanitizedResult]>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) error_message: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -317,18 +319,4 @@ pub(crate) struct ResultPayload {
     pub(crate) started_at_ms: Option<i64>,
     pub(crate) finished_at_ms: Option<i64>,
     pub(crate) duration_ms: Option<i64>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub(crate) struct ProgressPayload {
-    pub(crate) params_total: u32,
-    pub(crate) params_tested: u32,
-    pub(crate) requests_sent: u64,
-    /// Requests that never reached the target (connect/TLS/timeout/transport).
-    /// A large share of these means "not scanned", not "nothing found".
-    pub(crate) requests_failed: u64,
-    pub(crate) findings_so_far: u64,
-    pub(crate) estimated_completion_pct: u32,
-    /// Recommended delay (ms) before next poll; 0 when done/cancelled.
-    pub(crate) suggested_poll_interval_ms: u64,
 }

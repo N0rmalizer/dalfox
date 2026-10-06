@@ -345,7 +345,6 @@ impl<'a> DomXssVisitor<'a> {
                                 self.report_vulnerability_with_source(
                                     new_expr.span(),
                                     callee_name,
-                                    "Tainted data passed to constructor",
                                     source,
                                 );
                                 break;
@@ -422,9 +421,12 @@ impl<'a> DomXssVisitor<'a> {
         params: &FormalParameters<'a>,
         statements: &[Statement<'a>],
     ) {
-        let saved_tainted = self.tainted_vars.clone();
-        let saved_aliases = self.var_aliases.clone();
-        let saved_response_vars = self.response_object_vars.clone();
+        // Journal checkpoints rather than clones: a clone per body made `N`
+        // tainted bindings followed by `N` callbacks O(N²). The rollback below
+        // restores exactly what a clone would have held.
+        let tainted_checkpoint = self.tainted_vars.checkpoint();
+        let aliases_checkpoint = self.var_aliases.checkpoint();
+        let response_vars_checkpoint = self.response_object_vars.checkpoint();
         let param_names = self.function_param_bindings(params);
         // `global_taints` is deliberately *not* saved wholesale — see the
         // escape handling below. Only the shadowed parameter names are lifted
@@ -448,16 +450,22 @@ impl<'a> DomXssVisitor<'a> {
         // an unrelated outer name of the same spelling.
         let mut locals: HashSet<String> = param_names.into_iter().collect();
         Self::collect_declared_names(statements, &mut locals);
+        // Names tainted now but not at entry, read off the journal so the scan
+        // costs what the body wrote, not the size of the whole tainted set.
         let escaped: Vec<(String, Option<String>)> = self
             .tainted_vars
-            .iter()
-            .filter(|name| !saved_tainted.contains(*name) && !locals.contains(*name))
-            .map(|name| (name.clone(), self.var_aliases.get(name).cloned()))
+            .keys_added_since(&tainted_checkpoint)
+            .into_iter()
+            .filter(|name| !locals.contains(name))
+            .map(|name| {
+                let source = self.var_aliases.get(&name).cloned();
+                (name, source)
+            })
             .collect();
 
-        self.tainted_vars = saved_tainted;
-        self.var_aliases = saved_aliases;
-        self.response_object_vars = saved_response_vars;
+        self.tainted_vars.rollback(tainted_checkpoint);
+        self.var_aliases.rollback(aliases_checkpoint);
+        self.response_object_vars.rollback(response_vars_checkpoint);
         self.global_taints.extend(shadowed_globals);
         for (name, source) in escaped {
             if let Some(source) = source {
@@ -610,12 +618,7 @@ impl<'a> DomXssVisitor<'a> {
     pub(super) fn walk_import_expression(&mut self, import_expr: &ImportExpression<'a>) {
         if self.is_tainted(&import_expr.source) {
             let source = self.find_source_in_expr(&import_expr.source);
-            self.report_vulnerability_with_source(
-                import_expr.span,
-                "import",
-                "Tainted module specifier passed to dynamic import() runs attacker-controlled module code",
-                source,
-            );
+            self.report_vulnerability_with_source(import_expr.span, "import", source);
         }
         self.walk_expression(&import_expr.source);
     }

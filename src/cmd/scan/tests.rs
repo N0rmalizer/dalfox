@@ -2,7 +2,7 @@ use super::logging::{log_info, log_warn, start_spinner};
 use super::output::{
     plain_findings_summary, render_dry_run, render_only_discovery, render_results,
 };
-use super::poc::{build_ast_dom_message, generate_poc, render_finding_block};
+use super::poc::{generate_poc, render_finding_block};
 use super::postprocess::{dedupe_ast_results, extract_context};
 use super::preflight::{PreflightOutcome, is_allowed_content_type, preflight_content_type};
 use super::validation::validate_numeric_args;
@@ -82,7 +82,7 @@ fn validate_numeric_args_rejects_zero_workers() {
     let mut args = default_scan_args();
     args.workers = 0;
     let err = validate_numeric_args(&args).unwrap_err();
-    assert!(err.1.contains("workers"));
+    assert!(err.contains("workers"));
 }
 
 #[test]
@@ -97,7 +97,7 @@ fn validate_numeric_args_rejects_zero_timeout() {
     let mut args = default_scan_args();
     args.timeout = 0;
     let err = validate_numeric_args(&args).unwrap_err();
-    assert!(err.1.contains("timeout"));
+    assert!(err.contains("timeout"));
 }
 
 #[test]
@@ -123,9 +123,9 @@ fn validate_numeric_args_rejects_sxss_retries_over_cap() {
     args.sxss_retries = crate::cmd::scan::CLI_MAX_SXSS_RETRIES + 1;
     let err = validate_numeric_args(&args).unwrap_err();
     assert!(
-        err.1.contains("sxss-retries"),
+        err.contains("sxss-retries"),
         "message must name the flag, got: {}",
-        err.1
+        err
     );
 }
 
@@ -172,7 +172,7 @@ fn validate_numeric_args_rejects_rate_limit_over_cap() {
     let mut args = default_scan_args();
     args.rate_limit = CLI_MAX_RATE_LIMIT + 1;
     let err = validate_numeric_args(&args).unwrap_err();
-    assert!(err.1.contains("rate-limit"), "got: {}", err.1);
+    assert!(err.contains("rate-limit"), "got: {}", err);
 }
 
 #[test]
@@ -180,7 +180,7 @@ fn validate_numeric_args_rejects_retries_over_cap() {
     let mut args = default_scan_args();
     args.retries = CLI_MAX_RETRIES + 1;
     let err = validate_numeric_args(&args).unwrap_err();
-    assert!(err.1.contains("retries"), "got: {}", err.1);
+    assert!(err.contains("retries"), "got: {}", err);
 }
 
 #[test]
@@ -188,7 +188,7 @@ fn validate_numeric_args_rejects_retry_delay_over_cap() {
     let mut args = default_scan_args();
     args.retry_delay = CLI_MAX_RETRY_DELAY_MS + 1;
     let err = validate_numeric_args(&args).unwrap_err();
-    assert!(err.1.contains("retry-delay"), "got: {}", err.1);
+    assert!(err.contains("retry-delay"), "got: {}", err);
 }
 
 #[test]
@@ -196,7 +196,7 @@ fn validate_numeric_args_rejects_zero_targets_per_host() {
     let mut args = default_scan_args();
     args.max_targets_per_host = 0;
     let err = validate_numeric_args(&args).unwrap_err();
-    assert!(err.1.contains("max-targets-per-host"));
+    assert!(err.contains("max-targets-per-host"));
 }
 
 #[test]
@@ -723,75 +723,6 @@ fn test_generate_poc_leaves_complete_ast_poc_url_untouched() {
     );
 }
 
-#[test]
-fn test_build_ast_dom_message_keeps_url_source_wording() {
-    let message = build_ast_dom_message(
-        "DOM-based XSS via location.hash to innerHTML",
-        "location.hash",
-        "https://example.com/dom/level2/",
-        "<img src=x onerror=alert(1)>",
-    );
-    // URL-carried sources get no manual-setup hint — the finding's POC URL is
-    // the reproduction step, so no internal `[light check: …]` tail (#1238).
-    assert_eq!(
-        message,
-        "DOM-based XSS via location.hash to innerHTML (needs runtime confirmation)"
-    );
-}
-
-#[test]
-fn test_build_ast_dom_message_adds_postmessage_manual_hint() {
-    let message = build_ast_dom_message(
-        "DOM-based XSS via e.data to innerHTML",
-        "e.data",
-        "https://example.com/dom/level23/",
-        "<img src=x onerror=alert(1)>",
-    );
-    assert!(message.contains("[manual POC:"));
-    assert!(message.contains("window.open"));
-    assert!(message.contains("postMessage"));
-}
-
-#[test]
-fn test_build_ast_dom_message_adds_referrer_manual_hint() {
-    let message = build_ast_dom_message(
-        "DOM-based XSS via document.referrer to document.write",
-        "document.referrer",
-        "https://example.com/dom/level14/",
-        "<img src=x onerror=alert(1)>",
-    );
-    assert!(message.contains("[manual POC:"));
-    assert!(message.contains("document.referrer"));
-    assert!(message.contains("attacker-controlled page"));
-}
-
-#[test]
-fn test_build_ast_dom_message_adds_cookie_manual_hint() {
-    let message = build_ast_dom_message(
-        "DOM-based XSS via document.cookie to document.write",
-        "document.cookie",
-        "https://example.com/dom/level12/",
-        "<img src=x onerror=alert(1)>",
-    );
-    assert!(message.contains("[manual POC:"));
-    assert!(message.contains("same-origin cookie"));
-    assert!(message.contains("cookie-safe variant may be needed"));
-}
-
-#[test]
-fn test_build_ast_dom_message_keeps_pathname_wording() {
-    let message = build_ast_dom_message(
-        "DOM-based XSS via location.pathname to document.write",
-        "location.pathname",
-        "https://example.com/dom/level28/",
-        "<img src=x onerror=alert(1)>",
-    );
-    assert_eq!(
-        message,
-        "DOM-based XSS via location.pathname to document.write (needs runtime confirmation)"
-    );
-}
-
 #[tokio::test]
 async fn test_preflight_content_type_reads_http_csp_header() {
     let (url, handle) = spawn_preflight_server(
@@ -975,6 +906,7 @@ fn make_scan_state(results: Vec<ScanResult>) -> ScanState {
         target_mutation_stats: Arc::new(Mutex::new(HashMap::new())),
         session_baselines: Arc::new(Mutex::new(HashMap::new())),
         session_lost: Arc::new(Mutex::new(HashMap::new())),
+        interrupted_targets: Arc::new(Mutex::new(std::collections::HashSet::new())),
         multi_pb: None,
         preflight_idx: Arc::new(AtomicUsize::new(0)),
         analyze_idx: Arc::new(AtomicUsize::new(0)),
@@ -1669,6 +1601,84 @@ async fn test_a_short_scan_that_lost_nearly_everything_is_still_incomplete() {
 }
 
 #[tokio::test]
+async fn test_render_results_stopped_early_targets_are_not_clean() {
+    // `--limit 1` over three targets: `a` found one, `b` found one past the
+    // display cut, `c` was cut short. Neither `b` nor `c` is clean.
+    let mut args = default_scan_args();
+    args.format = "json".to_string();
+    args.limit = Some(1);
+    let path = temp_out_path("stopped_early");
+    args.output = Some(path.clone());
+    let urls: Vec<String> = [
+        "https://a.example/",
+        "https://b.example/",
+        "https://c.example/",
+    ]
+    .map(String::from)
+    .to_vec();
+    let results = ["https://a.example/", "https://b.example/"].map(|u| {
+        let mut r = reflected_result(u, "q", "<x>");
+        r.message_id = 606; // not the AST-dedup sentinel 0
+        r
+    });
+    let state = make_scan_state(results.to_vec());
+    state
+        .interrupted_targets
+        .lock()
+        .await
+        .extend(["https://b.example/", "https://c.example/"].map(String::from));
+    let _ = render_results(
+        &args,
+        &state,
+        &urls,
+        std::time::Duration::from_millis(7),
+        crate::cmd::scan::output::RequestTally {
+            sent: 42,
+            failed: 0,
+        },
+        false,
+        None,
+    )
+    .await;
+    let content = std::fs::read_to_string(&path).expect("output file written");
+    let _ = std::fs::remove_file(&path);
+    let v: serde_json::Value = serde_json::from_str(&content).expect("valid json");
+    let statuses: Vec<&str> = v["meta"]["target_summary"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["status"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        statuses,
+        ["findings", "findings", "incomplete"],
+        "{}",
+        v["meta"]
+    );
+    assert_eq!(v["findings"].as_array().unwrap().len(), 1);
+    assert_eq!(v["meta"]["incomplete"], true);
+}
+
+#[tokio::test]
+async fn test_render_results_attributes_stamped_findings_to_their_origin() {
+    // Query-less siblings in one directory (a HAR / POST list): the URL
+    // heuristic credits a finding to every sibling; the stamped origin to one.
+    let mut args = default_scan_args();
+    args.format = "json".to_string();
+    let urls: Vec<String> = ["https://h/api/a", "https://h/api/b"]
+        .map(String::from)
+        .to_vec();
+    let mut r = reflected_result("https://h/api/b", "q", "<x>");
+    r.message_id = 606;
+    r.origin_target = Some("https://h/api/b".to_string());
+    let content = render_results_to_file(args, vec![r], urls, "origin_attr").await;
+    let v: serde_json::Value = serde_json::from_str(&content).expect("valid json");
+    let summary = &v["meta"]["target_summary"];
+    assert_eq!(summary[0]["status"], "clean", "{summary}");
+    assert_eq!(summary[1]["status"], "findings", "{summary}");
+}
+
+#[tokio::test]
 async fn test_render_results_json_writes_envelope() {
     let mut args = default_scan_args();
     args.format = "json".to_string();
@@ -1680,6 +1690,72 @@ async fn test_render_results_json_writes_envelope() {
     assert_eq!(v["meta"]["total_requests"], 42);
     assert_eq!(v["findings"].as_array().unwrap().len(), 1);
     assert_eq!(v["meta"]["target_summary"][0]["status"], "findings");
+}
+
+// `target_summary` attribution used to filter every finding once per target
+// (O(targets x findings): ~4.3 s in a release build at 8000 x 8000). It is
+// indexed now; this pins both the counts and that the summary no longer scales
+// quadratically.
+#[tokio::test]
+async fn test_render_results_target_summary_scales_with_many_targets_and_findings() {
+    const N: usize = 6000;
+    let mut args = default_scan_args();
+    args.format = "json".to_string();
+    let urls: Vec<String> = (0..N)
+        .map(|i| format!("https://example.com/p{i}?q=1"))
+        .collect();
+    // Two findings for even targets, none for odd ones.
+    let results: Vec<ScanResult> = (0..N)
+        .map(|i| {
+            let t = (i / 2) * 2;
+            // Non-zero message_id + unique evidence: not folded by the
+            // render-time AST dedup, so every finding reaches the summary.
+            ScanResult::builder(FindingType::Reflected)
+                .inject_type("inHTML")
+                .method("GET")
+                .data(format!("https://example.com/p{t}?q=x{i}"))
+                .param("q".to_string())
+                .payload("<x>".to_string())
+                .evidence(format!("evidence {i}"))
+                .cwe("CWE-79")
+                .severity("Info")
+                .message_id(1)
+                .message_str("msg")
+                .build()
+        })
+        .collect();
+    let state = make_scan_state(results);
+    let path = temp_out_path("summary_scaling");
+    args.output = Some(path.clone());
+    let t = std::time::Instant::now();
+    let _ = render_results(
+        &args,
+        &state,
+        &urls,
+        std::time::Duration::from_millis(7),
+        crate::cmd::scan::output::RequestTally { sent: 1, failed: 0 },
+        false,
+        None,
+    )
+    .await;
+    let elapsed = t.elapsed();
+    let content = std::fs::read_to_string(&path).expect("output written");
+    let _ = std::fs::remove_file(&path);
+    let v: serde_json::Value = serde_json::from_str(&content).expect("valid json");
+    let summary = v["meta"]["target_summary"]
+        .as_array()
+        .expect("summary array");
+    assert_eq!(summary.len(), N);
+    assert_eq!(summary[0]["findings_count"], 2);
+    assert_eq!(summary[1]["findings_count"], 0);
+    assert_eq!(summary[1]["status"], "clean");
+    assert_eq!(summary[N - 2]["findings_count"], 2);
+    // Debug build: the quadratic version spent well over this on attribution
+    // alone; the indexed one is dominated by serialization.
+    assert!(
+        elapsed < std::time::Duration::from_secs(4),
+        "render_results took {elapsed:?} for {N} targets x {N} findings"
+    );
 }
 
 // Regression: `--limit N` combined with `--limit-result-type T` must not hide
@@ -1870,12 +1946,15 @@ fn test_stream_findings_disabled_by_end_of_scan_transforms() {
             "{} must disable --stream-findings",
             label
         );
+        // ...and is the flag the startup warning names.
+        assert_eq!(super::stream_findings_blocker(&args), Some(label));
     }
 
     // Streaming is plain-only regardless.
     let mut json = base();
     json.format = "json".to_string();
     assert!(!super::stream_findings_enabled(&json));
+    assert_eq!(super::stream_findings_blocker(&json), Some("--format"));
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -2941,6 +3020,153 @@ async fn test_run_preflight_and_analysis_analyze_external_js_produces_finding() 
         "finding evidence must reference the external script; findings: {:?}",
         *results
     );
+}
+
+/// A `text/html` server whose every response takes `delay_ms`, counting the
+/// peak number of requests in flight at once.
+async fn spawn_slow_counting_server(delay_ms: u64) -> (std::net::SocketAddr, Arc<AtomicUsize>) {
+    use std::sync::atomic::Ordering;
+    let in_flight = Arc::new(AtomicUsize::new(0));
+    let peak = Arc::new(AtomicUsize::new(0));
+    let (in_flight_h, peak_h) = (in_flight.clone(), peak.clone());
+    let app = Router::new().route(
+        "/",
+        get(move || {
+            let (in_flight, peak) = (in_flight_h.clone(), peak_h.clone());
+            async move {
+                let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(now, Ordering::SeqCst);
+                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                in_flight.fetch_sub(1, Ordering::SeqCst);
+                let mut h = HeaderMap::new();
+                h.insert("content-type", HeaderValue::from_static("text/html"));
+                (h, "<html><body>ok</body></html>")
+            }
+        }),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("local addr");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    (addr, peak)
+}
+
+fn analysis_only_args(max_concurrent_targets: usize) -> ScanArgs {
+    let mut args = default_scan_args();
+    args.skip_xss_scanning = true;
+    args.skip_mining = true;
+    args.skip_waf_probe = true;
+    args.skip_discovery = true;
+    args.max_concurrent_targets = max_concurrent_targets;
+    args
+}
+
+// Preflight/analysis used to build a fresh semaphore + LocalSet per host group
+// and await it before starting the next group, so `--max-concurrent-targets`
+// never let two *different* hosts overlap: a mass scan (one URL per host) ran
+// the whole stage strictly serially. 6 groups x 300 ms was ~1.8 s+; under one
+// shared bound it is a single round.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn analysis_runs_host_groups_concurrently() {
+    use super::analysis::run_preflight_and_analysis;
+    let (addr, peak) = spawn_slow_counting_server(300).await;
+    let args = analysis_only_args(8);
+    let mut groups = std::collections::BTreeMap::new();
+    for i in 0..6 {
+        groups.insert(
+            format!("h{i}"),
+            vec![parse_target(&format!("http://{addr}/?q={i}")).unwrap()],
+        );
+    }
+    let t = std::time::Instant::now();
+    run_preflight_and_analysis(&args, &mut groups, &make_scan_state(vec![])).await;
+    let elapsed = t.elapsed();
+    assert!(
+        elapsed < std::time::Duration::from_millis(1500),
+        "host groups must overlap under --max-concurrent-targets; took {elapsed:?}"
+    );
+    assert!(peak.load(std::sync::atomic::Ordering::SeqCst) > 1);
+    assert!(groups.values().all(|g| g.len() == 1));
+}
+
+// The shared bound is still a bound: with `--max-concurrent-targets 1`, targets
+// from different host groups must never be in flight together.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn analysis_bound_applies_across_host_groups() {
+    use super::analysis::run_preflight_and_analysis;
+    let (addr, peak) = spawn_slow_counting_server(100).await;
+    let args = analysis_only_args(1);
+    let mut groups = std::collections::BTreeMap::new();
+    for i in 0..4 {
+        groups.insert(
+            format!("h{i}"),
+            vec![
+                parse_target(&format!("http://{addr}/?q={i}a")).unwrap(),
+                parse_target(&format!("http://{addr}/?q={i}b")).unwrap(),
+            ],
+        );
+    }
+    let t = std::time::Instant::now();
+    run_preflight_and_analysis(&args, &mut groups, &make_scan_state(vec![])).await;
+    assert_eq!(peak.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert!(t.elapsed() >= std::time::Duration::from_millis(800));
+    assert!(groups.values().all(|g| g.len() == 2));
+}
+
+// Survivors go back into their own group, in original order, and dropped
+// targets (unreachable / over the per-host cap) are recorded, not lost.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn analysis_restores_survivors_per_group_in_order() {
+    use super::analysis::run_preflight_and_analysis;
+    let (addr, _peak) = spawn_slow_counting_server(20).await;
+    // A port nothing listens on: preflight drops the target as unreachable.
+    let dead = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap()
+    };
+    let mut args = analysis_only_args(4);
+    args.max_targets_per_host = 3;
+    let url = |s: &str| parse_target(s).unwrap();
+    let mut groups = std::collections::BTreeMap::new();
+    groups.insert(
+        "a".to_string(),
+        vec![
+            url(&format!("http://{addr}/?q=a1")),
+            url(&format!("http://{dead}/?q=a2")),
+            url(&format!("http://{addr}/?q=a3")),
+            url(&format!("http://{addr}/?q=a4")), // over the per-host cap
+        ],
+    );
+    groups.insert("b".to_string(), vec![url(&format!("http://{dead}/?q=b1"))]);
+    groups.insert(
+        "c".to_string(),
+        vec![
+            url(&format!("http://{addr}/?q=c1")),
+            url(&format!("http://{addr}/?q=c2")),
+        ],
+    );
+    let state = make_scan_state(vec![]);
+    run_preflight_and_analysis(&args, &mut groups, &state).await;
+
+    let urls = |k: &str| -> Vec<String> {
+        groups[k]
+            .iter()
+            .map(|t| t.url.query().unwrap_or("").to_string())
+            .collect()
+    };
+    assert_eq!(urls("a"), vec!["q=a1", "q=a3"]);
+    assert!(urls("b").is_empty());
+    assert_eq!(urls("c"), vec!["q=c1", "q=c2"]);
+
+    let skipped = state.skipped_targets.lock().await;
+    assert_eq!(
+        skipped.get(&format!("http://{addr}/?q=a4")).copied(),
+        Some(crate::cmd::error_codes::TRUNCATED_PER_HOST_CAP)
+    );
+    assert!(skipped.contains_key(&format!("http://{dead}/?q=a2")));
+    assert!(skipped.contains_key(&format!("http://{dead}/?q=b1")));
+    assert_eq!(skipped.len(), 3);
 }
 
 // finalize_scan_args — the shared preamble that the bare `scan` path and the

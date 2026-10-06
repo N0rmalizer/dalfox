@@ -27,14 +27,24 @@
 macro_rules! dbg_log {
     ($($arg:tt)*) => {{
         if $crate::DEBUG.load(::std::sync::atomic::Ordering::Relaxed) {
-            let __ts = ::chrono::Local::now().format("%-I:%M%p").to_string();
             $crate::ceprintln!(
-                "\x1b[90m{}\x1b[0m \x1b[35mDBG\x1b[0m {}",
-                __ts,
+                "{} {}",
+                $crate::utils::log::log_prefix("35", "DBG"),
                 ::std::format!($($arg)*)
             );
         }
     }};
+}
+
+/// The `{ts} {LABEL}` head shared by every dalfox log line: a dim `%-I:%M%p`
+/// timestamp and `label` painted with the ANSI SGR `color` (`"36"` cyan INF,
+/// `"33"` yellow WRN, `"31"` red, `"35"` magenta DBG). Callers pick the stream
+/// (`cprintln!` / `ceprintln!`), which strips the ANSI under `--no-color`.
+pub fn log_prefix(color: &str, label: &str) -> String {
+    format!(
+        "\x1b[90m{}\x1b[0m \x1b[{color}m{label}\x1b[0m",
+        chrono::Local::now().format("%-I:%M%p")
+    )
 }
 
 /// Neutralize log-injection bytes before a message is written to a log sink
@@ -60,4 +70,21 @@ pub(crate) fn sanitize_log_message(msg: &str) -> std::borrow::Cow<'_, str> {
         }
     }
     std::borrow::Cow::Owned(out)
+}
+
+/// Print `msg` on stderr the first time this process sees it. For warnings
+/// about a run-wide input (a file named by a flag) raised from code that runs
+/// once per target and per injection surface, which would otherwise repeat
+/// the same line for every target.
+pub(crate) fn eprintln_once(msg: String) {
+    use std::sync::{Mutex, OnceLock, PoisonError};
+    static SEEN: OnceLock<Mutex<std::collections::HashSet<String>>> = OnceLock::new();
+    let first = SEEN
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .insert(msg.clone());
+    if first {
+        eprintln!("{msg}");
+    }
 }

@@ -1,6 +1,7 @@
 //! Preflight + parameter-analysis stage. For every target (bounded by
-//! `--max-concurrent-targets`) this runs the content-type/CSP/WAF preflight,
-//! parameter discovery + mining, and initial-response AST DOM analysis,
+//! `--max-concurrent-targets`, one bound shared across all host groups) this
+//! runs the content-type/CSP/WAF preflight, parameter discovery + mining, and
+//! initial-response AST DOM analysis,
 //! replacing each host group with the targets that survived preflight. Lifted
 //! verbatim out of `run_scan`; the shared handles arrive via [`ScanState`].
 
@@ -11,6 +12,7 @@ use super::preflight::{PreflightOutcome, is_allowed_content_type, preflight_cont
 use super::session::SessionBaseline;
 use crate::parameter_analysis::analyze_parameters;
 use crate::target_parser::Target;
+use crate::utils::log::log_prefix;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -71,26 +73,14 @@ pub(crate) async fn run_preflight_and_analysis(
     host_groups: &mut std::collections::BTreeMap<String, Vec<Target>>,
     state: &ScanState,
 ) {
-    // Rebind the shared state to owned locals so the loop body below is
-    // identical to the pre-split `run_scan` (it threads these through nested
-    // `spawn_local` tasks via `.clone()`).
-    let results = state.results.clone();
-    let findings_count = state.findings_count.clone();
     let skipped_targets = state.skipped_targets.clone();
-    let target_meta = state.target_meta.clone();
-    let target_mutation_stats = state.target_mutation_stats.clone();
-    let session_baselines = state.session_baselines.clone();
-    let session_lost = state.session_lost.clone();
-    let multi_pb = state.multi_pb.clone();
-    let preflight_idx = state.preflight_idx.clone();
-    let analyze_idx = state.analyze_idx.clone();
-    let total_targets = state.total_targets;
-    let spinner_allowed = state.spinner_allowed;
 
+    // Limit targets per host. Targets above the cap aren't silently dropped —
+    // record them in skipped_targets so target_summary surfaces the skip with
+    // the TRUNCATED_PER_HOST_CAP error code instead of "clean". This is the
+    // only place `--max-targets-per-host` applies; the scan stage inherits the
+    // truncated groups.
     for group in host_groups.values_mut() {
-        // Limit targets per host. Targets above the cap aren't silently dropped
-        // — record them in skipped_targets so target_summary surfaces the skip
-        // with the TRUNCATED_PER_HOST_CAP error code instead of "clean".
         if group.len() > args.max_targets_per_host {
             let dropped: Vec<String> = group
                 .iter()
@@ -99,10 +89,9 @@ pub(crate) async fn run_preflight_and_analysis(
                 .collect();
             if !dropped.is_empty() {
                 if !args.silence {
-                    let ts = chrono::Local::now().format("%-I:%M%p").to_string();
                     crate::ceprintln!(
-                        "\x1b[90m{}\x1b[0m \x1b[33mWARN\x1b[0m max-targets-per-host cap ({}) reached; {} target(s) skipped",
-                        ts,
+                        "{} max-targets-per-host cap ({}) reached; {} target(s) skipped",
+                        log_prefix("33", "WARN"),
                         args.max_targets_per_host,
                         dropped.len()
                     );
@@ -114,104 +103,114 @@ pub(crate) async fn run_preflight_and_analysis(
             }
             group.truncate(args.max_targets_per_host);
         }
+    }
 
-        // Bound overall concurrency for preflight + analysis with the same cap as scanning
-        let pre_analyze_semaphore = Arc::new(tokio::sync::Semaphore::new(
-            crate::utils::semaphore_permits(args.max_concurrent_targets),
-        ));
+    // One bound for the whole stage, shared by every host group — the same
+    // shape as the scan stage's `global_semaphore`. This used to be a fresh
+    // semaphore + LocalSet per host group, awaited before the next group
+    // started, so `--max-concurrent-targets` only ever applied *within* one
+    // host: a mass scan where every URL is a different host ran preflight,
+    // discovery and mining strictly one target at a time.
+    let sem = Arc::new(tokio::sync::Semaphore::new(
+        crate::utils::semaphore_permits(args.max_concurrent_targets),
+    ));
 
-        // Move targets out of the group to own them in spawned tasks
-        let mut drained: Vec<Target> = Vec::new();
-        drained.append(group);
+    // Move every target out, tagged with its group's position in the map, so
+    // the survivors can be put back into the right group in original order.
+    let group_count = host_groups.len();
+    let mut drained: Vec<(usize, Target)> = Vec::new();
+    for (gi, group) in host_groups.values_mut().enumerate() {
+        drained.extend(group.drain(..).map(|t| (gi, t)));
+    }
 
-        let processed: Vec<Target> = {
-            let local = LocalSet::new();
-            // Clone shared indices and config for this LocalSet to avoid moving them
-            let preflight_idx_outer = preflight_idx.clone();
-            let analyze_idx_outer = analyze_idx.clone();
-            let args_outer = args.clone();
-            let pre_analyze_semaphore_outer = pre_analyze_semaphore.clone();
-            let total_targets_outer = total_targets;
-            let multi_pb_outer = multi_pb.clone();
-            let results_outer = results.clone();
-            let findings_count_outer = findings_count.clone();
-            let skipped_targets_outer = skipped_targets.clone();
-            let target_meta_outer = target_meta.clone();
-            let target_mutation_stats_outer = target_mutation_stats.clone();
-            let session_baselines_outer = session_baselines.clone();
-            let session_lost_outer = session_lost.clone();
-            local
-                .run_until(async move {
-                    let mut handles = vec![];
+    let ctx_template = TargetTaskCtx {
+        args_clone: args.clone(),
+        preflight_idx_clone: state.preflight_idx.clone(),
+        analyze_idx_clone: state.analyze_idx.clone(),
+        total_targets_copy: state.total_targets,
+        spinner_allowed: state.spinner_allowed,
+        multi_pb_clone: state.multi_pb.clone(),
+        results_clone: state.results.clone(),
+        findings_count_clone: state.findings_count.clone(),
+        skipped_targets_clone: skipped_targets.clone(),
+        target_meta_clone: state.target_meta.clone(),
+        target_mutation_stats_clone: state.target_mutation_stats.clone(),
+        session_baselines_clone: state.session_baselines.clone(),
+        session_lost_clone: state.session_lost.clone(),
+    };
 
-                    for target in drained {
-                        // Kept outside the task so a panicking task can still be reported
-                        // against its target instead of vanishing (see the collector).
-                        let panic_target_url = target.url.to_string();
-                        let ctx = TargetTaskCtx {
-                            args_clone: args_outer.clone(),
-                            sem: pre_analyze_semaphore_outer.clone(),
-                            preflight_idx_clone: preflight_idx_outer.clone(),
-                            analyze_idx_clone: analyze_idx_outer.clone(),
-                            total_targets_copy: total_targets_outer,
-                            spinner_allowed,
-                            multi_pb_clone: multi_pb_outer.clone(),
-                            results_clone: results_outer.clone(),
-                            findings_count_clone: findings_count_outer.clone(),
-                            skipped_targets_clone: skipped_targets_outer.clone(),
-                            target_meta_clone: target_meta_outer.clone(),
-                            target_mutation_stats_clone: target_mutation_stats_outer.clone(),
-                            session_baselines_clone: session_baselines_outer.clone(),
-                            session_lost_clone: session_lost_outer.clone(),
-                        };
+    // A single LocalSet for every group: parameter analysis holds !Send
+    // values (`scraper::Html`) across awaits, so these tasks are spawned with
+    // `spawn_local` rather than `tokio::spawn`.
+    let local = LocalSet::new();
+    let processed: Vec<Vec<Target>> = local
+        .run_until(async move {
+            let mut handles = Vec::with_capacity(drained.len());
 
-                        handles.push((
-                            panic_target_url,
-                            tokio::task::spawn_local(preflight_and_analyze_target(target, ctx)),
-                        ));
+            for (gi, target) in drained {
+                // Acquire before spawning, so at most `max_concurrent_targets`
+                // tasks are ever live — not one parked task per input target.
+                // The permit moves into the task and is released when it ends
+                // (unwinding included).
+                let Ok(permit) = sem.clone().acquire_owned().await else {
+                    break;
+                };
+                // Kept outside the task so a panicking task can still be reported
+                // against its target instead of vanishing (see the collector).
+                let panic_target_url = target.url.to_string();
+                let ctx = ctx_template.clone();
+                handles.push((
+                    gi,
+                    panic_target_url,
+                    tokio::task::spawn_local(async move {
+                        let _permit = permit;
+                        preflight_and_analyze_target(target, ctx).await
+                    }),
+                ));
+            }
+
+            // Collect processed targets (skipping those filtered by preflight),
+            // in dispatch order — which is each group's original order.
+            let mut processed: Vec<Vec<Target>> = vec![Vec::new(); group_count];
+            for (gi, target_url, handle) in handles {
+                match handle.await {
+                    Ok(Some(t)) => processed[gi].push(t),
+                    // Preflight deliberately dropped this target; it has
+                    // already recorded its own `skipped_targets` entry.
+                    Ok(None) => {}
+                    // A panic in here used to be swallowed whole: the
+                    // target silently disappeared from `processed`, never
+                    // reached the injection stage, and the run finished
+                    // `0 XSS` with exit 0 — a scanner reporting "clean" for
+                    // a target it crashed on. Surface it and record the
+                    // target as skipped so `target_summary` says
+                    // INTERNAL_ERROR instead of clean. The injection
+                    // stage in `scan_loop.rs` does the same.
+                    Err(e) => {
+                        // Sanitized: a `JoinError`'s Display carries the
+                        // panic message, and panic messages quote the data
+                        // that caused them — a slice-boundary panic embeds
+                        // bytes straight from the scanned response. A raw
+                        // CR/LF there would let a target forge log lines.
+                        eprintln!(
+                            "[scan] preflight/analysis task failed for {}: {}",
+                            crate::utils::log::sanitize_log_message(&target_url),
+                            crate::utils::log::sanitize_log_message(&e.to_string())
+                        );
+                        skipped_targets
+                            .lock()
+                            .await
+                            .insert(target_url, crate::cmd::error_codes::INTERNAL_ERROR);
                     }
+                }
+            }
+            processed
+        })
+        .await;
 
-                    // Collect processed targets (skipping those filtered by preflight)
-                    let mut processed: Vec<Target> = Vec::new();
-                    for (target_url, handle) in handles {
-                        match handle.await {
-                            Ok(Some(t)) => processed.push(t),
-                            // Preflight deliberately dropped this target; it has
-                            // already recorded its own `skipped_targets` entry.
-                            Ok(None) => {}
-                            // A panic in here used to be swallowed whole: the
-                            // target silently disappeared from `processed`, never
-                            // reached the injection stage, and the run finished
-                            // `0 XSS` with exit 0 — a scanner reporting "clean" for
-                            // a target it crashed on. Surface it and record the
-                            // target as skipped so `target_summary` says
-                            // INTERNAL_ERROR instead of clean. The injection
-                            // stage in `scan_loop.rs` does the same.
-                            Err(e) => {
-                                // Sanitized: a `JoinError`'s Display carries the
-                                // panic message, and panic messages quote the data
-                                // that caused them — a slice-boundary panic embeds
-                                // bytes straight from the scanned response. A raw
-                                // CR/LF there would let a target forge log lines.
-                                eprintln!(
-                                    "[scan] preflight/analysis task failed for {}: {}",
-                                    crate::utils::log::sanitize_log_message(&target_url),
-                                    crate::utils::log::sanitize_log_message(&e.to_string())
-                                );
-                                skipped_targets_outer
-                                    .lock()
-                                    .await
-                                    .insert(target_url, crate::cmd::error_codes::INTERNAL_ERROR);
-                            }
-                        }
-                    }
-                    processed
-                })
-                .await
-        };
-
-        // Replace group with processed targets
-        *group = processed;
+    // Replace each group with its processed targets.
+    for (group, survivors) in host_groups.values_mut().zip(processed) {
+        *group = survivors;
     }
 }
 
@@ -224,7 +223,6 @@ pub(crate) async fn run_preflight_and_analysis(
 #[derive(Clone)]
 pub(crate) struct TargetTaskCtx {
     pub(crate) args_clone: ScanArgs,
-    pub(crate) sem: Arc<tokio::sync::Semaphore>,
     pub(crate) preflight_idx_clone: Arc<std::sync::atomic::AtomicUsize>,
     pub(crate) analyze_idx_clone: Arc<std::sync::atomic::AtomicUsize>,
     pub(crate) total_targets_copy: usize,
@@ -249,7 +247,6 @@ pub(crate) async fn preflight_and_analyze_target(
 ) -> Option<Target> {
     let TargetTaskCtx {
         args_clone,
-        sem,
         preflight_idx_clone,
         analyze_idx_clone,
         total_targets_copy,
@@ -263,10 +260,8 @@ pub(crate) async fn preflight_and_analyze_target(
         session_baselines_clone,
         session_lost_clone,
     } = ctx;
-    // Bound concurrency across targets for preflight + analysis
-    let Ok(_permit) = sem.acquire_owned().await else {
-        return None;
-    };
+    // Concurrency across targets is bounded by the caller, which holds a
+    // `--max-concurrent-targets` permit for the lifetime of this task.
     let PreflightCapture {
         csp_present: __preflight_csp_present,
         csp_header: __preflight_csp_header,
@@ -290,14 +285,10 @@ pub(crate) async fn preflight_and_analyze_target(
     // render a single overall progress line instead of this per-target block,
     // so the whole block is gated on `total_targets_copy == 1`.
     if args_clone.format == "plain" && !args_clone.silence && total_targets_copy == 1 {
-        let ts = chrono::Local::now().format("%-I:%M%p").to_string();
-        crate::cprintln!(
-            "\x1b[90m{}\x1b[0m \x1b[36mINF\x1b[0m start scan to {}",
-            ts,
-            target.url
-        );
+        let inf = log_prefix("36", "INF");
+        crate::cprintln!("{} start scan to {}", inf, target.url);
         if __preflight_csp_present {
-            crate::cprintln!("\x1b[90m{}\x1b[0m \x1b[36mINF\x1b[0m CSP: enabled", ts);
+            crate::cprintln!("{} CSP: enabled", inf);
             if let Some((hn, hv)) = &__preflight_csp_header {
                 crate::cprintln!(
                     "  \x1b[90m└──\x1b[0m \x1b[38;5;247m{}:\x1b[0m \x1b[38;5;247m{}\x1b[0m",
@@ -310,8 +301,8 @@ pub(crate) async fn preflight_and_analyze_target(
         if let Some(ref waf_info) = target.waf_info {
             for fp in &waf_info.detected {
                 crate::cprintln!(
-                    "\x1b[90m{}\x1b[0m \x1b[33mWAF\x1b[0m {} detected (confidence: {:.0}%, evidence: {})",
-                    ts,
+                    "{} {} detected (confidence: {:.0}%, evidence: {})",
+                    log_prefix("33", "WAF"),
                     fp.waf_type,
                     fp.confidence * 100.0,
                     fp.evidence
@@ -342,11 +333,7 @@ pub(crate) async fn preflight_and_analyze_target(
                 .map(|d| format!("{}", d.tech))
                 .collect();
             if !tech_names.is_empty() {
-                crate::cprintln!(
-                    "\x1b[90m{}\x1b[0m \x1b[36mINF\x1b[0m tech: {}",
-                    ts,
-                    tech_names.join(", ")
-                );
+                crate::cprintln!("{} tech: {}", inf, tech_names.join(", "));
             }
         }
     }
@@ -461,10 +448,9 @@ pub(crate) async fn preflight_and_analyze_target(
     // Pretty reflection summary (plain only)
     if args_clone.format == "plain" && !args_clone.silence && total_targets_copy == 1 {
         let n = target.reflection_params.len();
-        let ts = chrono::Local::now().format("%-I:%M%p").to_string();
         crate::cprintln!(
-            "\x1b[90m{}\x1b[0m \x1b[36mINF\x1b[0m found reflected \x1b[33m{}\x1b[0m params",
-            ts,
+            "{} found reflected \x1b[33m{}\x1b[0m params",
+            log_prefix("36", "INF"),
             n
         );
         for (i, p) in target.reflection_params.iter().enumerate() {
@@ -763,10 +749,9 @@ async fn run_target_preflight(
                     && args_clone.format == "plain"
                     && total_targets_copy == 1
                 {
-                    let ts = chrono::Local::now().format("%-I:%M%p").to_string();
                     crate::cprintln!(
-                        "\x1b[90m{}\x1b[0m \x1b[33mWAF\x1b[0m evasion activated: adaptive jitter + cooldown",
-                        ts
+                        "{} evasion activated: adaptive jitter + cooldown",
+                        log_prefix("33", "WAF")
                     );
                 }
             }
@@ -815,7 +800,7 @@ pub(crate) async fn detect_outdated_libs(
     if args_clone.detect_outdated_libs
         && let Some(body) = preflight_response_body
     {
-        let lib_findings = crate::scanning::vuln_libs::library_findings(
+        let mut lib_findings = crate::scanning::vuln_libs::library_findings(
             crate::scanning::vuln_libs::detect_vulnerable_libraries(body),
             target.url.as_str(),
             &target.method,
@@ -828,6 +813,7 @@ pub(crate) async fn detect_outdated_libs(
                 &lib_findings,
                 &args_clone.limit_result_type.to_uppercase(),
             );
+            crate::scanning::result::stamp_origin(&mut lib_findings, target.url.as_str());
             let mut guard = results_clone.lock().await;
             guard.extend(lib_findings);
             findings_count_clone.fetch_add(added, Ordering::Relaxed);
@@ -858,18 +844,20 @@ async fn run_initial_ast_pass(
     if !args_clone.skip_ast_analysis
         && let Some(response_text) = preflight_response_body
     {
-        let ast_batch = crate::scanning::ast_integration::run_initial_ast_dom_analysis_for_response(
-            response_text,
-            response_content_type,
-            target.url.as_str(),
-            &target.method,
-            crate::scanning::ast_integration::PageSecurityPosture::from_target(target),
-        );
+        let mut ast_batch =
+            crate::scanning::ast_integration::run_initial_ast_dom_analysis_for_response(
+                response_text,
+                response_content_type,
+                target.url.as_str(),
+                &target.method,
+                crate::scanning::ast_integration::PageSecurityPosture::from_target(target),
+            );
         if !ast_batch.is_empty() {
             let added = crate::scanning::count_matching_results(
                 &ast_batch,
                 &args_clone.limit_result_type.to_uppercase(),
             );
+            crate::scanning::result::stamp_origin(&mut ast_batch, target.url.as_str());
             let mut guard = results_clone.lock().await;
             guard.extend(ast_batch);
             findings_count_clone.fetch_add(added, Ordering::Relaxed);
@@ -878,13 +866,14 @@ async fn run_initial_ast_pass(
             && crate::utils::response_has_markup_document(response_content_type, response_text)
         {
             let ext_client = target.build_client_or_default();
-            let ext_batch = crate::scanning::fetch_and_analyze_external_js(
+            let mut ext_batch = crate::scanning::fetch_and_analyze_external_js(
                 &ext_client,
                 target,
                 response_text,
                 args_clone,
             )
             .await;
+            crate::scanning::result::stamp_origin(&mut ext_batch, target.url.as_str());
             crate::scanning::accumulate_findings(
                 results_clone,
                 findings_count_clone,

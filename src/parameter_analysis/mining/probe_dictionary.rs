@@ -20,7 +20,11 @@ pub async fn probe_dictionary_params(
     let mut loaded = false;
 
     if !args.remote_wordlists.is_empty() {
-        if let Err(e) = crate::payload::init_remote_wordlists(&args.remote_wordlists).await
+        if let Err(e) = crate::payload::init_remote_wordlists_with(
+            &args.remote_wordlists,
+            crate::payload::RemoteFetchOptions::default(),
+        )
+        .await
             && !args.silence
         {
             eprintln!("Error initializing remote wordlists: {}", e);
@@ -55,7 +59,10 @@ pub async fn probe_dictionary_params(
             Err(e) => {
                 // Always surface an unreadable user-supplied wordlist on
                 // stderr; machine-readable stdout remains clean.
-                eprintln!("Error reading wordlist file {}: {}", wordlist_path, e);
+                crate::utils::log::eprintln_once(format!(
+                    "Error reading wordlist file {}: {}",
+                    wordlist_path, e
+                ));
                 return;
             }
         }

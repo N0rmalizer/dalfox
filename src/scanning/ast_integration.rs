@@ -183,6 +183,13 @@ fn extract_js_and_script_ids_from_xml_document(
     let mut js_blocks = Vec::new();
     let mut script_ids = HashSet::new();
     let mut seen = HashSet::new();
+    // Keep the first copy of each JS body, deduped by its trimmed text.
+    let mut push_js = |code: String| {
+        let key = code.trim().to_string();
+        if !key.is_empty() && seen.insert(key) {
+            js_blocks.push(code);
+        }
+    };
 
     match document {
         crate::utils::xml::XmlDocument::Parsed(document) => {
@@ -207,42 +214,20 @@ fn extract_js_and_script_ids_from_xml_document(
                             .any(|attr| attr.name() == "href" && attr.namespace().is_some());
                     let script_type = node.attribute("type").unwrap_or("");
                     if !has_external_source && xml_script_type_is_javascript(script_type) {
-                        let code: String = node
-                            .descendants()
-                            .filter(|child| child.is_text())
-                            .filter_map(|child| child.text())
-                            .collect();
-                        let key = code.trim().to_string();
-                        if !key.is_empty() && seen.insert(key) {
-                            js_blocks.push(code);
-                        }
+                        push_js(
+                            node.descendants()
+                                .filter(|child| child.is_text())
+                                .filter_map(|child| child.text())
+                                .collect(),
+                        );
                     }
                 }
 
                 for attr in node.attributes() {
-                    let name = attr.name();
-                    let value = attr.value().trim();
-                    if value.is_empty() {
-                        continue;
-                    }
-                    let code = if name.starts_with("on") && name.len() > 2 {
-                        Some(value.to_string())
-                    } else if name == "href"
-                        && (attr.namespace().is_none()
-                            || attr.namespace() == Some("http://www.w3.org/1999/xlink"))
-                        && value
-                            .get(..11)
-                            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("javascript:"))
-                    {
-                        Some(value[11..].trim().to_string())
-                    } else {
-                        None
-                    };
-                    if let Some(code) = code {
-                        let key = code.trim().to_string();
-                        if !key.is_empty() && seen.insert(key) {
-                            js_blocks.push(code);
-                        }
+                    let href_ok = attr.namespace().is_none()
+                        || attr.namespace() == Some("http://www.w3.org/1999/xlink");
+                    if let Some(code) = xml_attr_js(attr.name(), attr.value(), href_ok) {
+                        push_js(code.to_string());
                     }
                 }
             }
@@ -268,32 +253,13 @@ fn extract_js_and_script_ids_from_xml_document(
                         }
                     }
                     if element.attr("src").is_none() && script_type_is_javascript(element) {
-                        let code: String = node.text().collect();
-                        let key = code.trim().to_string();
-                        if !key.is_empty() && seen.insert(key) {
-                            js_blocks.push(code);
-                        }
+                        push_js(node.text().collect());
                     }
                 }
 
                 for (name, value) in element.attrs() {
-                    let value = value.trim();
-                    let code = if name.starts_with("on") && name.len() > 2 {
-                        Some(value.to_string())
-                    } else if name == "href"
-                        && value
-                            .get(..11)
-                            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("javascript:"))
-                    {
-                        Some(value[11..].trim().to_string())
-                    } else {
-                        None
-                    };
-                    if let Some(code) = code {
-                        let key = code.trim().to_string();
-                        if !key.is_empty() && seen.insert(key) {
-                            js_blocks.push(code);
-                        }
+                    if let Some(code) = xml_attr_js(name, value, true) {
+                        push_js(code.to_string());
                     }
                 }
             }
@@ -304,30 +270,30 @@ fn extract_js_and_script_ids_from_xml_document(
     (js_blocks, script_ids)
 }
 
+/// The JS an XML attribute carries: an `on*` handler's (trimmed) body, or the
+/// body of a `javascript:` `href` when `href_ok` (the attribute's namespace
+/// allows it to navigate).
+fn xml_attr_js<'v>(name: &str, value: &'v str, href_ok: bool) -> Option<&'v str> {
+    let value = value.trim();
+    if name.starts_with("on") && name.len() > 2 {
+        Some(value)
+    } else if name == "href"
+        && href_ok
+        && value
+            .get(..11)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("javascript:"))
+    {
+        Some(value[11..].trim())
+    } else {
+        None
+    }
+}
+
 fn xml_script_type_is_javascript(script_type: &str) -> bool {
     let script_type = script_type
         .trim_matches(|c| matches!(c, '\t' | '\n' | '\u{000C}' | '\r' | ' '))
         .to_ascii_lowercase();
-    matches!(
-        script_type.as_str(),
-        "" | "module"
-            | "application/ecmascript"
-            | "application/javascript"
-            | "application/x-ecmascript"
-            | "application/x-javascript"
-            | "text/ecmascript"
-            | "text/javascript"
-            | "text/javascript1.0"
-            | "text/javascript1.1"
-            | "text/javascript1.2"
-            | "text/javascript1.3"
-            | "text/javascript1.4"
-            | "text/javascript1.5"
-            | "text/jscript"
-            | "text/livescript"
-            | "text/x-ecmascript"
-            | "text/x-javascript"
-    )
+    script_type.is_empty() || is_js_mime_essence(&script_type)
 }
 
 /// Extract JS blocks (inline `<script>` bodies, `on*` handler bodies, and
@@ -412,8 +378,14 @@ pub(crate) fn script_type_is_javascript(element: &scraper::node::Element) -> boo
             Some(language) => format!("text/{}", language.to_ascii_lowercase()),
         },
     };
+    is_js_mime_essence(&script_type)
+}
+
+/// Whether a lowercased, trimmed script `type` is a JavaScript MIME essence
+/// (or `module`) per HTML's script preparation rules.
+pub(crate) fn is_js_mime_essence(script_type: &str) -> bool {
     matches!(
-        script_type.as_str(),
+        script_type,
         "module"
             | "application/ecmascript"
             | "application/javascript"
@@ -655,7 +627,7 @@ pub(crate) fn grade_ast_finding(
     } else if bootstrapped_from_url {
         // The page seeds this non-URL source from a query parameter itself, so
         // no attacker-controlled driver page is needed after all — a link is
-        // still enough. Detected by `has_self_bootstrap_verification`, which is
+        // still enough. Detected by `has_self_bootstrap_verification_normalized`, which is
         // exactly the "bootstraps a DOM source from a predictable query param"
         // check. Using it for reachability is sound; using it to promote the
         // *tier* (as the legacy paths do) is what is being retired.
@@ -1107,7 +1079,10 @@ pub(crate) fn build_dom_xss_manual_poc_hint(
     None
 }
 
-fn normalize_js_for_pattern_matching(js_code: &str) -> String {
+/// Whitespace-stripped form of a script block that
+/// [`has_self_bootstrap_verification_normalized`] matches against. Callers
+/// checking several findings from one block normalize it once and reuse it.
+pub(crate) fn normalize_js_for_pattern_matching(js_code: &str) -> String {
     js_code.chars().filter(|c| !c.is_whitespace()).collect()
 }
 
@@ -1133,12 +1108,24 @@ fn has_storage_bootstrap(normalized_js: &str, storage_api: &str, key: &str) -> b
     normalized_js.contains(&single) || normalized_js.contains(&double)
 }
 
+/// [`has_self_bootstrap_verification_normalized`] on a raw script block.
+#[cfg(test)]
+pub(crate) fn has_self_bootstrap_verification(js_code: &str, source: &str) -> bool {
+    has_self_bootstrap_verification_normalized(&normalize_js_for_pattern_matching(js_code), source)
+}
+
 /// Confirm pages that bootstrap a non-URL DOM source from a predictable query
 /// parameter in the same script block, which lets Dalfox emit a stronger result
 /// for deterministic self-triggering xssmaze-style flows.
-pub(crate) fn has_self_bootstrap_verification(js_code: &str, source: &str) -> bool {
-    let normalized_js = normalize_js_for_pattern_matching(js_code);
-    if !has_seed_query_bootstrap(&normalized_js) {
+///
+/// Takes the block already passed through
+/// [`normalize_js_for_pattern_matching`], so a block with many findings is
+/// normalized once instead of once per finding.
+pub(crate) fn has_self_bootstrap_verification_normalized(
+    normalized_js: &str,
+    source: &str,
+) -> bool {
+    if !has_seed_query_bootstrap(normalized_js) {
         return false;
     }
 
@@ -1157,14 +1144,14 @@ pub(crate) fn has_self_bootstrap_verification(js_code: &str, source: &str) -> bo
         // Relay-based bootstrap (iframe relay pattern)
         let relay_pattern = normalized_js.contains("document.referrer")
             && contains_any(
-                &normalized_js,
+                normalized_js,
                 &[
                     "searchParams.set('child','1')",
                     "searchParams.set(\"child\",\"1\")",
                 ],
             )
             && contains_any(
-                &normalized_js,
+                normalized_js,
                 &[
                     "document.getElementById('relay').src=",
                     "document.getElementById(\"relay\").src=",
@@ -1174,14 +1161,14 @@ pub(crate) fn has_self_bootstrap_verification(js_code: &str, source: &str) -> bo
         // Direct document.write bootstrap pattern
         let write_pattern = normalized_js.contains("document.write(document.referrer)")
             && contains_any(
-                &normalized_js,
+                normalized_js,
                 &[
                     "searchParams.set('child','1')",
                     "searchParams.set(\"child\",\"1\")",
                 ],
             )
             && contains_any(
-                &normalized_js,
+                normalized_js,
                 &[
                     "searchParams.delete('seed')",
                     "searchParams.delete(\"seed\")",
@@ -1192,21 +1179,21 @@ pub(crate) fn has_self_bootstrap_verification(js_code: &str, source: &str) -> bo
 
     if source.contains("localStorage.getItem(") {
         if let Some(key) = extract_parenthesized_suffix(source, "localStorage.getItem(") {
-            return has_storage_bootstrap(&normalized_js, "localStorage", key);
+            return has_storage_bootstrap(normalized_js, "localStorage", key);
         }
         return normalized_js.contains("localStorage.setItem(") && normalized_js.contains("seed");
     }
 
     if source.contains("sessionStorage.getItem(") {
         if let Some(key) = extract_parenthesized_suffix(source, "sessionStorage.getItem(") {
-            return has_storage_bootstrap(&normalized_js, "sessionStorage", key);
+            return has_storage_bootstrap(normalized_js, "sessionStorage", key);
         }
         return normalized_js.contains("sessionStorage.setItem(") && normalized_js.contains("seed");
     }
 
     if source.contains("history.state") {
         return contains_any(
-            &normalized_js,
+            normalized_js,
             &[
                 "history.replaceState(seed",
                 "history.pushState(seed",
@@ -1218,7 +1205,7 @@ pub(crate) fn has_self_bootstrap_verification(js_code: &str, source: &str) -> bo
 
     if source.contains("event.newValue") || source.contains("event.oldValue") {
         return contains_any(
-            &normalized_js,
+            normalized_js,
             &[
                 "addEventListener('storage',",
                 "addEventListener(\"storage\",",
@@ -1230,7 +1217,7 @@ pub(crate) fn has_self_bootstrap_verification(js_code: &str, source: &str) -> bo
 
     if source.contains("ServiceWorker.message") {
         return contains_any(
-            &normalized_js,
+            normalized_js,
             &[
                 "serviceWorker.dispatchEvent(newMessageEvent('message'",
                 "serviceWorker.dispatchEvent(newMessageEvent(\"message\"",
@@ -1251,7 +1238,7 @@ pub(crate) fn has_self_bootstrap_verification(js_code: &str, source: &str) -> bo
 
     if source.contains("WebSocket.message") || source.contains("EventSource.message") {
         return contains_any(
-            &normalized_js,
+            normalized_js,
             &[
                 "dispatchEvent(newMessageEvent('message'",
                 "dispatchEvent(newMessageEvent(\"message\"",
@@ -1269,7 +1256,6 @@ pub(crate) fn has_self_bootstrap_verification(js_code: &str, source: &str) -> bo
 #[cfg(test)]
 pub(crate) fn analyze_javascript_for_dom_xss(
     js_code: &str,
-    _url: &str,
 ) -> Vec<(
     crate::scanning::ast_dom_analysis::DomXssVulnerability,
     String,
@@ -1277,7 +1263,6 @@ pub(crate) fn analyze_javascript_for_dom_xss(
 )> {
     analyze_javascript_for_dom_xss_with_html_context(
         js_code,
-        _url,
         &HashSet::new(),
         &Default::default(),
         false,
@@ -1295,7 +1280,6 @@ pub(crate) fn analyze_javascript_for_dom_xss(
 /// TrustedHTML-sink findings it neutralizes.
 pub(crate) fn analyze_javascript_for_dom_xss_with_html_context(
     js_code: &str,
-    _url: &str,
     script_element_ids: &HashSet<String>,
     reflected_markup: &crate::scanning::ast_dom_analysis::PageMarkup,
     trusted_types_enforced: bool,
@@ -1459,13 +1443,17 @@ pub(crate) fn run_initial_ast_dom_analysis_for_response(
     for js_code in js_blocks {
         let findings = analyze_javascript_for_dom_xss_with_html_context(
             &js_code,
-            target_url,
             &script_element_ids,
             &page_markup,
             posture.trusted_types_enforced,
         );
+        // Normalized once per block, not once per finding.
+        let mut normalized_js: Option<String> = None;
         for (vuln, payload, description) in findings {
-            let self_bootstrap_verified = has_self_bootstrap_verification(&js_code, &vuln.source);
+            let normalized_js =
+                normalized_js.get_or_insert_with(|| normalize_js_for_pattern_matching(&js_code));
+            let self_bootstrap_verified =
+                has_self_bootstrap_verification_normalized(normalized_js, &vuln.source);
             let message = if let Some(hint) =
                 build_dom_xss_manual_poc_hint(target_url, &vuln.source, &payload)
             {

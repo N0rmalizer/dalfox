@@ -108,7 +108,6 @@ pub(crate) use waf_strategy::*;
 use crate::cmd::scan::ScanArgs;
 use crate::parameter_analysis::Param;
 use crate::scanning::check_dom_verification::check_dom_verification_with_evidence;
-use crate::scanning::check_reflection::check_reflection_with_response_tracked;
 use crate::scanning::result::FindingType;
 use crate::target_parser::Target;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
@@ -334,10 +333,9 @@ const BLOCKED_STREAK_LIMIT: u32 = 64;
 /// *Consecutive* 3xx-redirect responses that end the DOM phase.
 ///
 /// A redirect can never produce a DOM verification: browsers do not render a
-/// 3xx response body (only `Location:` drives navigation), and
-/// [`check_dom_verification::check_redirect_location`] returns `None` for every
-/// `javascript:` / `data:` / reflected-`next=` redirect (see its doc — modern
-/// browsers refuse to execute those from a `Location:` header). So a DOM payload
+/// 3xx response body (only `Location:` drives navigation), and DOM verification
+/// never treats a `javascript:` / `data:` / reflected-`next=` `Location:` as
+/// evidence (modern browsers refuse to execute those from a redirect header). So a DOM payload
 /// sent to a redirecting response is guaranteed non-verifying, and a long run of
 /// them is pure waste — the reflection phase already recorded any `R` the
 /// `Location:` echo warrants.
@@ -532,9 +530,7 @@ impl ScanWorkerCtx {
     ///
     /// Returns the injection status alongside the classified reflection so the
     /// reflection phase's transformed-inert-echo budget can exclude 4xx block
-    /// pages. Uses the crate-private status-aware path
-    /// ([`check_reflection::check_reflection_with_response_status`]); the public
-    /// `_tracked` entry keeps its `(kind, body)` contract for external callers.
+    /// pages (see [`check_reflection::check_reflection_with_response`]).
     async fn fetch_reflection(
         &self,
         param: &Param,
@@ -547,8 +543,8 @@ impl ScanWorkerCtx {
         bool,
     ) {
         let _permit = self.req_budget.acquire().await;
-        check_reflection::check_reflection_with_response_status(
-            Some(self.client.as_ref()),
+        check_reflection::check_reflection_with_response(
+            self.client.as_ref(),
             &self.target,
             param,
             payload,
@@ -612,7 +608,8 @@ impl ScanWorkerCtx {
         if local_results.is_empty() {
             return;
         }
-        let batch = std::mem::take(local_results);
+        let mut batch = std::mem::take(local_results);
+        crate::scanning::result::stamp_origin(&mut batch, self.target.url.as_str());
         let added = count_matching_results(&batch, &self.limit_result_type);
         let mut guard = self.results.lock().await;
         guard.extend(batch);
@@ -846,8 +843,8 @@ impl ScanWorkerCtx {
                 break;
             }
             let (kind, response_text, _, xml_content_type) =
-                check_reflection::check_reflection_with_response_status(
-                    Some(client),
+                check_reflection::check_reflection_with_response(
+                    client,
                     &self.target,
                     param,
                     pp,
@@ -874,7 +871,7 @@ impl ScanWorkerCtx {
                 // check if the probe marker actually appears in the response.
                 // This ensures breakout payloads get a chance to be tried
                 // for params reflected inside safe tags (title, textarea, etc.).
-                if crate::scanning::markers::classify_probe_reflection(text).detected() {
+                if crate::scanning::markers::probe_reflected(text) {
                     probe_reflected = true;
                     probe_response_text = response_text;
                     probe_response_is_javascript = is_javascript;
@@ -916,8 +913,8 @@ impl ScanWorkerCtx {
         // scan is cancelled — it is a second HTTP request per parameter.
         if !probe_reflected && !self.cancelled() {
             let numeric_probe = crate::scanning::check_reflection::NUMERIC_PROBE_MARKER;
-            let (kind, _) = check_reflection_with_response_tracked(
-                Some(client),
+            let (kind, ..) = check_reflection::check_reflection_with_response(
+                client,
                 &self.target,
                 param,
                 numeric_probe,
@@ -1831,6 +1828,12 @@ pub async fn run_scanning(
         generate_param_jobs(target, &args, waf_strategy.as_ref(), &shared_payloads);
 
     let pb = build_scan_progress_bar(&multi_pb, total_tasks, target);
+    // The CLI's per-host-group overall bar is created empty and sized here, by
+    // the same count that sizes this target's own bar: both are ticked
+    // together by `inc_progress`, so they cannot disagree.
+    if let Some(ref opb) = overall_pb {
+        opb.inc_length(total_tasks);
+    }
 
     let found_params = Arc::new(RwLock::new(FoundParams {
         reflection: HashSet::new(),
@@ -1999,13 +2002,17 @@ fn collapse_redundant_reflected(
     target_url: &str,
 ) -> Vec<crate::scanning::result::Result> {
     use std::collections::HashSet;
-    let belongs = |data: &str| crate::utils::finding_belongs_to_target(target_url, data);
+    // The recorded origin when set, else the `data`-URL heuristic.
+    let belongs = |r: &crate::scanning::result::Result| match &r.origin_target {
+        Some(origin) => origin == target_url,
+        None => crate::utils::finding_belongs_to_target(target_url, &r.data),
+    };
     let key = |r: &crate::scanning::result::Result| {
         (r.param.clone(), r.location.clone(), r.inject_type.clone())
     };
     let verified_keys: HashSet<(String, String, String)> = results
         .iter()
-        .filter(|r| r.result_type == FindingType::Verified && belongs(&r.data))
+        .filter(|r| r.result_type == FindingType::Verified && belongs(r))
         .map(key)
         .collect();
     if verified_keys.is_empty() {
@@ -2015,15 +2022,13 @@ fn collapse_redundant_reflected(
         .into_iter()
         .filter(|r| {
             !(r.result_type == FindingType::Reflected
-                && belongs(&r.data)
+                && belongs(r)
                 && verified_keys.contains(&key(r)))
         })
         .collect()
 }
 
-pub(crate) use xss_blind::{
-    CallbackSource, blind_scan_forms_with, blind_scanning, blind_scanning_with,
-};
+pub(crate) use xss_blind::{CallbackSource, blind_scan_forms_with, blind_scanning_with};
 
 #[cfg(test)]
 mod tests;

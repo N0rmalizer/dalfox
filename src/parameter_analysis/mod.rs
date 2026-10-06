@@ -52,7 +52,7 @@ pub(crate) type DiscoveredParams = Vec<Param>;
 #[allow(dead_code)]
 pub(crate) type ProbedParams = Vec<Param>;
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Location {
     Query,
     Body,
@@ -1100,38 +1100,15 @@ pub async fn active_probe_param(
 
         for (enc_type, rounds) in crate::encoding::pre_encoding::multi_url_decode_probes() {
             let enc_name = enc_type.as_str();
-            let mut encoded = raw_marker.clone();
             // For Query: append_pair adds one URL-encoding layer automatically,
             // so we encode (N-1) times for N-decode detection.
             // For Path: selective_path_segment_encode encodes '%' to '%25' (one layer),
             // so we also encode (N-1) extra times.
-            for _ in 0..*rounds {
-                encoded = crate::encoding::url_encode(&encoded);
-            }
+            let encoded = crate::encoding::repeat_url_encode(&raw_marker, usize::from(*rounds));
 
             let _permit = semaphore.acquire().await.expect("acquire semaphore permit");
             let url = match param.location {
-                Location::Query => {
-                    let mut url = target.url.clone();
-                    let mut new_pairs: Vec<(String, String)> = Vec::new();
-                    let mut replaced = false;
-                    for (k, val) in url.query_pairs() {
-                        if k == param.name {
-                            new_pairs.push((k.to_string(), encoded.clone()));
-                            replaced = true;
-                        } else {
-                            new_pairs.push((k.to_string(), val.to_string()));
-                        }
-                    }
-                    if !replaced {
-                        new_pairs.push((param.name.clone(), encoded.clone()));
-                    }
-                    url.query_pairs_mut().clear();
-                    for (k, val) in &new_pairs {
-                        url.query_pairs_mut().append_pair(k, val);
-                    }
-                    url
-                }
+                Location::Query => with_query_param(&target.url, &param.name, &encoded),
                 Location::Path => {
                     let mut url = target.url.clone();
                     if let Some(idx_str) = param.name.strip_prefix("path_segment_")
@@ -1522,16 +1499,18 @@ fn ensure_sxss_candidate_params(params: &mut Vec<Param>, target: &Target, args: 
         }
     }
 
+    // Keep whatever discovery produced for a slot — it carries probed
+    // specials / injection context that a bare synthesis does not. A set, not
+    // a scan of `params` per candidate: both grow with the URL/body size.
+    let mut present: std::collections::HashSet<(String, Location)> = params
+        .iter()
+        .map(|p| (p.name.clone(), p.location.clone()))
+        .collect();
     for (name, location) in candidates {
         if name.is_empty() || args.ignore_param.iter().any(|ignored| ignored == &name) {
             continue;
         }
-        // Keep whatever discovery produced for this slot — it carries probed
-        // specials / injection context that a bare synthesis does not.
-        if params
-            .iter()
-            .any(|p| p.name == name && p.location == location)
-        {
+        if !present.insert((name.clone(), location.clone())) {
             continue;
         }
         push_synthesized_param(params, &name, location, None);
@@ -1618,6 +1597,46 @@ pub(crate) fn unresolved_explicit_param_specs(
         }
     }
     missing
+}
+
+/// `base` with every `name` query pair's value set to `value`, or the pair
+/// appended when `name` is absent. Other pairs keep their order.
+pub(crate) fn with_query_param(base: &url::Url, name: &str, value: &str) -> url::Url {
+    let mut url = base.clone();
+    let mut replaced = false;
+    {
+        let mut pairs = url.query_pairs_mut();
+        pairs.clear();
+        for (k, v) in base.query_pairs() {
+            if k == name {
+                pairs.append_pair(&k, value);
+                replaced = true;
+            } else {
+                pairs.append_pair(&k, &v);
+            }
+        }
+        if !replaced {
+            pairs.append_pair(name, value);
+        }
+    }
+    url
+}
+
+/// Await every discovery/mining probe task and append the params they found
+/// to `reflection_params` in one lock acquisition, in spawn order.
+pub(crate) async fn extend_with_joined(
+    reflection_params: &Mutex<Vec<Param>>,
+    handles: Vec<tokio::task::JoinHandle<Option<Param>>>,
+) {
+    let mut batch: Vec<Param> = Vec::new();
+    for handle in handles {
+        if let Ok(Some(p)) = handle.await {
+            batch.push(p);
+        }
+    }
+    if !batch.is_empty() {
+        reflection_params.lock().await.extend(batch);
+    }
 }
 
 #[cfg(test)]

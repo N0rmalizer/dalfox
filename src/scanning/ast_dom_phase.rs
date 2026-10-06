@@ -46,17 +46,15 @@ pub(crate) async fn run_ast_dom_analysis(
         let findings =
             crate::scanning::ast_integration::analyze_javascript_for_dom_xss_with_html_context(
                 &js_code,
-                target.url.as_str(),
                 &script_element_ids,
                 &reflected_markup,
                 posture.trusted_types_enforced,
             );
+        // Normalized once per block (not per finding), and only once a
+        // finding survives the dedup below — the bootstrap check is pure, so
+        // running it after the `ast_seen` skip changes nothing but the cost.
+        let mut normalized_js: Option<String> = None;
         for (vuln, payload, description) in findings {
-            let self_bootstrap_verified =
-                crate::scanning::ast_integration::has_self_bootstrap_verification(
-                    &js_code,
-                    &vuln.source,
-                );
             let ast_key = format!(
                 "{}|{}|{}|{}|{}",
                 param.name, vuln.line, vuln.column, vuln.source, vuln.sink
@@ -65,6 +63,14 @@ pub(crate) async fn run_ast_dom_analysis(
                 continue;
             }
             ast_seen.insert(ast_key);
+            let normalized_js = normalized_js.get_or_insert_with(|| {
+                crate::scanning::ast_integration::normalize_js_for_pattern_matching(&js_code)
+            });
+            let self_bootstrap_verified =
+                crate::scanning::ast_integration::has_self_bootstrap_verification_normalized(
+                    normalized_js,
+                    &vuln.source,
+                );
             let source_uses_url_surface = ast_source_uses_browser_url_surface(&vuln.source);
             let result_url = if source_uses_url_surface {
                 crate::scanning::ast_integration::build_dom_xss_poc_url(
@@ -258,7 +264,11 @@ pub(crate) async fn fetch_and_analyze_external_js(
         if !resp.status().is_success() {
             continue;
         }
-        let body = match crate::utils::http::read_body(resp).await {
+        // Read one byte past the analysis cap, not the 16 MiB body cap: an
+        // oversized script is discarded below, so buffering the rest of it
+        // (per script, per page) was pure waste.
+        let body = match crate::utils::http::read_body_capped(resp, MAX_EXTERNAL_JS_BYTES + 1).await
+        {
             Ok(b) => b,
             Err(_) => continue,
         };
@@ -269,16 +279,20 @@ pub(crate) async fn fetch_and_analyze_external_js(
         let findings =
             crate::scanning::ast_integration::analyze_javascript_for_dom_xss_with_html_context(
                 &body,
-                target.url.as_str(),
                 &script_element_ids,
                 &Default::default(),
                 trusted_types_enforced,
             );
 
+        // Normalized once per script, not once per finding.
+        let mut normalized_js: Option<String> = None;
         for (vuln, payload, description) in findings {
+            let normalized_js = normalized_js.get_or_insert_with(|| {
+                crate::scanning::ast_integration::normalize_js_for_pattern_matching(&body)
+            });
             let self_bootstrap_verified =
-                crate::scanning::ast_integration::has_self_bootstrap_verification(
-                    &body,
+                crate::scanning::ast_integration::has_self_bootstrap_verification_normalized(
+                    normalized_js,
                     &vuln.source,
                 );
             let message =
